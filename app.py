@@ -317,7 +317,14 @@ def score_batter(row, opp, wx, w_era, w_whip, use_adv):
         "Runs Scored": round(on_base_score * pv * run_of * k_adj * env * 105, 2),
     }
     best = max(scores, key=scores.get)
-    return scores, best, scores[best]
+    derived = {
+        "iso":      round(iso, 3),
+        "wrc_plus": int(wrc_plus),
+        "k_pct":    round(k_pct, 4),
+        "hard_hit": round(hard_hit, 4),
+        "barrel":   round(barrel, 4),
+    }
+    return scores, best, scores[best], derived
 
 # ── SIDEBAR ──────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -454,11 +461,29 @@ if load_btn:
 
                     row["name"] = pname
 
+                    # Precompute display-safe derived metrics before scoring
+                    avg_val = float(row.get("avg") or 0)
+                    obp_val = float(row.get("obp") or 0)
+                    slg_val = float(row.get("slg") or 0)
+                    iso = float(row.get("iso") if row.get("iso") is not None else (slg_val - avg_val) or 0)
+                    ops_val = float(row.get("ops") or (obp_val + slg_val) or 0)
+                    wrc_plus = int(row.get("wrc_plus") or max(1, int((ops_val if ops_val > 0 else 0.700) * 152)))
+                    so = int(row.get("strikeOuts") or row.get("so") or 0)
+                    pa = int(row.get("plateAppearances") or row.get("pa") or 1)
+                    k_pct = float(row.get("k_pct") or (so / pa if pa > 0 else 0.22))
+                    hard_hit = float(row.get("hard_hit_pct") or min(0.65, 0.28 + iso * 1.2))
+                    barrel = float(row.get("barrel_pct") or min(0.20, iso * 0.35))
+
                     if (row.get("avg") or 0) < min_avg: continue
                     if opp_pitch.get("era",4.5) > max_era: continue
                     if order > max_ord: continue
 
-                    scores, best_market, best_score = score_batter(row, opp_pitch, wx, w_era, w_whip, use_adv)
+                    scores, best_market, best_score, derived = score_batter(row, opp_pitch, wx, w_era, w_whip, use_adv)
+                    iso       = derived["iso"]
+                    wrc_plus  = derived["wrc_plus"]
+                    k_pct     = derived["k_pct"]
+                    hard_hit  = derived["hard_hit"]
+                    barrel    = derived["barrel"]
                     flt = {k:v for k,v in scores.items() if k in allowed_markets}
                     if not flt: continue
                     best_market = max(flt, key=flt.get)
