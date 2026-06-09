@@ -26,3 +26,8 @@ streamlit run app.py
 When Fangraphs is available: AVG, OBP, ISO, wRC+, K%, HardHit%, Barrel%
 Fallback: AVG, OBP, SLG from MLB Stats API
 Both factor in: pitcher ERA, WHIP, HR/9, K/9 + park factor + weather + batting order position
+
+
+## Fix included
+- Added lxml and beautifulsoup4 to improve pybaseball/Fangraphs installs on Streamlit Cloud.
+- Added MLB fallback derivations for ISO, K%, wRC+ proxy, HardHit% proxy, and Barrel% proxy so metrics are not flat zeros when Fangraphs is unavailable.

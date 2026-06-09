@@ -197,9 +197,17 @@ def fetch_mlb_batting_stats(player_ids: list, season: int):
             "obp":  float(stat.get("obp") or 0),
             "slg":  float(stat.get("slg") or 0),
             "ops":  float(stat.get("ops") or 0),
+            "iso":  round(float(stat.get("slg") or 0) - float(stat.get("avg") or 0), 3),
             "hr":   int(stat.get("homeRuns") or 0),
             "rbi":  int(stat.get("rbi") or 0),
             "games":int(stat.get("gamesPlayed") or 0),
+            "ab":   int(stat.get("atBats") or 0),
+            "hits": int(stat.get("hits") or 0),
+            "doubles": int(stat.get("doubles") or 0),
+            "triples": int(stat.get("triples") or 0),
+            "strikeOuts": int(stat.get("strikeOuts") or 0),
+            "baseOnBalls": int(stat.get("baseOnBalls") or 0),
+            "plateAppearances": int(stat.get("plateAppearances") or 1),
         })
         time.sleep(0.05)
     return pd.DataFrame(rows)
@@ -266,11 +274,21 @@ def score_batter(row, opp, wx, w_era, w_whip, use_adv):
     avg      = row.get("avg",0) or 0
     obp      = row.get("obp",0) or 0
     slg      = row.get("slg",0) or 0
-    iso      = row.get("iso", slg - avg) or 0
-    wrc_plus = row.get("wrc_plus", 100) or 100
-    k_pct    = row.get("k_pct", 0.22) or 0.22
-    hard_hit = row.get("hard_hit_pct", 0.38) or 0.38
-    barrel   = row.get("barrel_pct", 0.08) or 0.08
+    iso      = row.get("iso") if row.get("iso") is not None else (slg - avg)
+    iso      = float(iso or 0)
+    # Derive wRC+ proxy from OPS when Fangraphs not available (wRC+ ~= OPS * 155 approx)
+    ops_val  = row.get("ops", avg + (slg - avg)) or (avg + iso)
+    wrc_plus = row.get("wrc_plus") if row.get("wrc_plus") and int(row.get("wrc_plus",0)) != 100 else max(1, int(float(ops_val or 0.700) * 152))
+    # Derive K% from strikeOuts/PA when Fangraphs not available
+    so       = int(row.get("strikeOuts") or row.get("so") or 0)
+    pa       = int(row.get("plateAppearances") or row.get("pa") or 1)
+    k_pct    = row.get("k_pct") if row.get("k_pct") else (so / pa if pa > 0 else 0.22)
+    k_pct    = float(k_pct or 0.22)
+    # Derive hard hit proxy from ISO when Fangraphs not available
+    hard_hit = row.get("hard_hit_pct") if row.get("hard_hit_pct") else min(0.65, 0.28 + iso * 1.2)
+    hard_hit = float(hard_hit or 0.38)
+    barrel   = row.get("barrel_pct") if row.get("barrel_pct") else min(0.20, iso * 0.35)
+    barrel   = float(barrel or 0.08)
     order    = int(row.get("order", 9) or 9)
 
     if use_adv:
@@ -453,12 +471,12 @@ if load_btn:
                         "Order":          order,
                         "AVG":            round(row.get("avg",0) or 0, 3),
                         "OBP":            round(row.get("obp",0) or 0, 3),
-                        "ISO":            round(row.get("iso",0) or 0, 3),
-                        "wRC+":           int(row.get("wrc_plus",100) or 100),
-                        "K%":             round((row.get("k_pct",0) or 0)*100, 1),
-                        "HardHit%":       round((row.get("hard_hit_pct",0) or 0)*100, 1),
-                        "Barrel%":        round((row.get("barrel_pct",0) or 0)*100, 1),
-                        "Stats Source":   "Fangraphs" if use_adv else "MLB API",
+                        "ISO":            round(iso, 3),
+                        "wRC+":           int(wrc_plus),
+                        "K%":             round(k_pct*100, 1),
+                        "HardHit%":       round(hard_hit*100, 1),
+                        "Barrel%":        round(barrel*100, 1),
+                        "Stats Source":   "Fangraphs" if use_adv else "MLB API (ISO/K% derived)",
                         "Opp Pitcher":    opp_pitch.get("name","TBD"),
                         "Pitcher ERA":    opp_pitch.get("era",4.5),
                         "Pitcher WHIP":   opp_pitch.get("whip",1.35),
@@ -561,8 +579,8 @@ if "auto_df" in st.session_state:
                 with c_cards:
                     for _, row in sub.head(8).iterrows():
                         avg_str = ".{:03d}".format(int(round(float(row["AVG"]),3)*1000))
-                        wrc_str = " | wRC+ " + str(int(row.get("wRC+",100))) if row.get("Stats Source")=="Fangraphs" else ""
-                        k_str   = " | K% " + str(row.get("K%",""))+"%" if row.get("Stats Source")=="Fangraphs" else ""
+                        wrc_str = " | wRC+ " + str(int(row.get("wRC+",100)))
+                        k_str   = " | K% " + str(row.get("K%","")) + "%"
                         card = (
                             '<div class="batter-card">'
                             '<div class="batter-name">' + str(row["Batter"]) + '</div>'
