@@ -453,7 +453,7 @@ if "auto_df" in st.session_state:
             disp = [c for c in SHOW + ["Best Market", "Best Score", "Lineup Status", "Stats Source"] if c in df.columns]
             st.dataframe(df[disp].reset_index(drop=True), use_container_width=True, hide_index=True,
                 column_config={
-                    "Best Score": st.column_config.ProgressColumn("Best Score", min_value=0, max_value=float(df["Best Score"].max()), format="%.1f", color="purple"),
+                    "Best Score": st.column_config.ProgressColumn("Best Score", min_value=0, max_value=float(df["Best Score"].max()), format="%.1f", color="#a12c7b"),
                     "AVG": st.column_config.NumberColumn("BA", format="%.3f"),
                     "OBP": st.column_config.NumberColumn(format="%.3f"),
                     "ISO": st.column_config.NumberColumn(format="%.3f"),
