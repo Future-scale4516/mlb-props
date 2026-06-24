@@ -9,7 +9,7 @@ st.set_page_config(page_title="MLB Prop Analyser v2", page_icon="⚾", layout="w
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght=400;500;600;700&display=swap');
 html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .stApp{background:#f7f6f2;}
 .metric-card{background:#fff;border-radius:12px;padding:14px 18px;border:1px solid #dcd9d5;
@@ -221,6 +221,7 @@ def wx_modifier(temp, wind, dome):
 def order_factor(order):
     return {1:1.00,2:0.97,3:0.97,4:0.95,5:0.93,6:0.90,7:0.87,8:0.84,9:0.80}.get(int(order or 9),0.80)
 
+# CRITICAL HOTFIX: Multiplied end scalar multipliers by roughly 2.5x to combat fraction compression
 def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
                  order, era, whip, hr9, k9, park_factor, temp, wind, dome, use_adv, w_era, w_whip):
     env = park_factor * wx_modifier(temp, wind, dome)
@@ -240,12 +241,13 @@ def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
         power   = max(0.05, slg - avg)
         on_base = obp
         
-    hits_runs_score = round(contact * pv * of * k_adj * env * 110, 2)
-    rbi_score       = round(contact * pv * rbi_of * k_adj * env * 100, 2)
-    hr_score        = round(power   * hrv * env * 95, 2)
-    runs_score      = round(on_base * pv * run_of * k_adj * env * 105, 2)
+    hits_runs_score = round(contact * pv * of * k_adj * env * 280, 2)
+    rbi_score       = round(contact * pv * rbi_of * k_adj * env * 260, 2)
+    hr_score        = round(power   * hrv * env * 280, 2)
+    runs_score      = round(on_base * pv * run_of * k_adj * env * 280, 2)
 
-    if iso < 0.130 or barrel < 0.06+4 or hr9 < 0.7:
+    # Balanced, logical vetoes
+    if iso < 0.130 or barrel < 0.04 or hr9 < 0.7:
         hr_score = 0.0
     if order > 7 or wrc_plus < 80:
         rbi_score = 0.0
@@ -279,9 +281,9 @@ with st.sidebar:
     w_whip = st.slider("WHIP Weight", 0.1, 0.9, 0.45, 0.05)
     st.markdown("---")
     
-    # REVISED: Lowered the visual thresholds to match reality
+    # CRITICAL HOTFIX: Calibrated Score Legend definitions to align with updated scaling math
     st.markdown("### 📊 Score Key")
-    st.markdown("🟢 **60+** : Premium Value\n🟡 **45-59** : Playable\n🔴 **<45** : Sub-optimal")
+    st.markdown("🟢 **70+** : Premium Value\n🟡 **48-69** : Playable\n🔴 **<48** : Sub-optimal")
     
     st.markdown("---")
     if st.button("Clear Cache"):
@@ -417,10 +419,10 @@ if load_btn:
                     best_market = max(flt, key=flt.get)
                     best_score  = flt[best_market]
                     
-                    # REVISED: Dynamic Grade Evaluation mapping mathematically accurate distributions
-                    if best_score >= 55.0:
+                    # CRITICAL HOTFIX: Calibrated grade badges to match the updated scale normalization
+                    if best_score >= 70.0:
                         grade_badge = "🟢 Premium"
-                    elif best_score >= 40.0:
+                    elif best_score >= 48.0:
                         grade_badge = "🟡 Playable"
                     else:
                         grade_badge = "🔴 Sub-optimal"
