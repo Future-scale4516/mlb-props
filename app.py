@@ -245,11 +245,11 @@ def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
     hr_score        = round(power   * hrv * env * 95, 2)
     runs_score      = round(on_base * pv * run_of * k_adj * env * 105, 2)
 
-    if iso < 0.160 or barrel < 0.06 or hr9 < 0.9:
+    if iso < 0.130 or barrel < 0.06+4 or hr9 < 0.7:
         hr_score = 0.0
-    if order > 6 or wrc_plus < 90:
+    if order > 7 or wrc_plus < 80:
         rbi_score = 0.0
-    if order > 3 or obp < 0.315:
+    if order > 5 or obp < 0.290:
         runs_score = 0.0
 
     return {
@@ -418,9 +418,9 @@ if load_btn:
                     best_score  = flt[best_market]
                     
                     # REVISED: Dynamic Grade Evaluation mapping mathematically accurate distributions
-                    if best_score >= 60.0:
+                    if best_score >= 55.0:
                         grade_badge = "🟢 Premium"
-                    elif best_score >= 45.0:
+                    elif best_score >= 40.0:
                         grade_badge = "🟡 Playable"
                     else:
                         grade_badge = "🔴 Sub-optimal"
