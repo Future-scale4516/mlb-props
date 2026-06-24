@@ -9,7 +9,7 @@ st.set_page_config(page_title="MLB Prop Analyser v2", page_icon="⚾", layout="w
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght=400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .stApp{background:#f7f6f2;}
 .metric-card{background:#fff;border-radius:12px;padding:14px 18px;border:1px solid #dcd9d5;
@@ -180,7 +180,7 @@ def fetch_active_roster(team_id: int):
                      "pos_type":pos.get("type"),"pos_abbr":pos.get("abbreviation")})
     return pd.DataFrame(rows)
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_live_lineups(game_pk: int):
     data = safe_get(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
     teams = data.get("liveData",{}).get("boxscore",{}).get("teams",{})
@@ -193,10 +193,15 @@ def fetch_live_lineups(game_pk: int):
             p = pmap.get(f"ID{pid}",{})
             raw = p.get("battingOrder")
             if raw:
-                try: slot = int(raw) // 100
-                except: slot = None
-                rows.append({"player_id":pid,"name":p.get("person",{}).get("fullName",""),"order":slot})
-        out[side] = pd.DataFrame(rows).sort_values("order") if rows else pd.DataFrame()
+                try: 
+                    slot = int(raw) // 100
+                    rows.append({"player_id":pid,"name":p.get("person",{}).get("fullName",""),"order":slot})
+                except: continue
+        
+        if rows:
+            out[side] = pd.DataFrame(rows).sort_values("order")
+        else:
+            out[side] = pd.DataFrame() 
     return out
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -221,7 +226,6 @@ def wx_modifier(temp, wind, dome):
 def order_factor(order):
     return {1:1.00,2:0.97,3:0.97,4:0.95,5:0.93,6:0.90,7:0.87,8:0.84,9:0.80}.get(int(order or 9),0.80)
 
-# CRITICAL HOTFIX: Multiplied end scalar multipliers by roughly 2.5x to combat fraction compression
 def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
                  order, era, whip, hr9, k9, park_factor, temp, wind, dome, use_adv, w_era, w_whip):
     env = park_factor * wx_modifier(temp, wind, dome)
@@ -246,7 +250,6 @@ def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
     hr_score        = round(power   * hrv * env * 280, 2)
     runs_score      = round(on_base * pv * run_of * k_adj * env * 280, 2)
 
-    # Balanced, logical vetoes
     if iso < 0.130 or barrel < 0.04 or hr9 < 0.7:
         hr_score = 0.0
     if order > 7 or wrc_plus < 80:
@@ -281,7 +284,6 @@ with st.sidebar:
     w_whip = st.slider("WHIP Weight", 0.1, 0.9, 0.45, 0.05)
     st.markdown("---")
     
-    # CRITICAL HOTFIX: Calibrated Score Legend definitions to align with updated scaling math
     st.markdown("### 📊 Score Key")
     st.markdown("🟢 **70+** : Premium Value\n🟡 **48-69** : Playable\n🔴 **<48** : Sub-optimal")
     
@@ -419,7 +421,6 @@ if load_btn:
                     best_market = max(flt, key=flt.get)
                     best_score  = flt[best_market]
                     
-                    # CRITICAL HOTFIX: Calibrated grade badges to match the updated scale normalization
                     if best_score >= 70.0:
                         grade_badge = "🟢 Premium"
                     elif best_score >= 48.0:
@@ -506,10 +507,31 @@ if "auto_df" in st.session_state:
         ])
 
         with all_t:
-            disp = [c for c in SHOW + ["Best Market", "Best Score", "Lineup Status"] if c in df.columns]
-            st.dataframe(df[disp].reset_index(drop=True), use_container_width=True, hide_index=True,
+            st.markdown("### 📋 Ranked Prop Targets")
+            
+            # NEW: The Multiselect Filter Bar
+            f_col1, f_col2, f_col3 = st.columns(3)
+            with f_col1:
+                sel_markets = st.multiselect("🎯 Filter by Market", options=df["Best Market"].unique(), default=df["Best Market"].unique())
+            with f_col2:
+                sel_grades = st.multiselect("📊 Filter by Grade", options=df["Grade"].unique(), default=df["Grade"].unique())
+            with f_col3:
+                sel_status = st.multiselect("⏳ Lineup Status", options=df["Lineup Status"].unique(), default=df["Lineup Status"].unique())
+            
+            # Apply user filters to the dataframe
+            filtered_df = df[
+                (df["Best Market"].isin(sel_markets)) & 
+                (df["Grade"].isin(sel_grades)) &
+                (df["Lineup Status"].isin(sel_status))
+            ]
+            
+            # Safely calculate the max score for the progress bar scaling
+            max_score = float(filtered_df["Best Score"].max()) if not filtered_df.empty else 100.0
+            
+            disp = [c for c in SHOW + ["Best Market", "Best Score", "Lineup Status"] if c in filtered_df.columns]
+            st.dataframe(filtered_df[disp].reset_index(drop=True), use_container_width=True, hide_index=True,
                 column_config={
-                    "Best Score": st.column_config.ProgressColumn("Best Score", min_value=0, max_value=float(df["Best Score"].max()), format="%.1f", color="#a12c7b"),
+                    "Best Score": st.column_config.ProgressColumn("Best Score", min_value=0, max_value=max_score, format="%.1f", color="#a12c7b"),
                     "AVG": st.column_config.NumberColumn("BA", format="%.3f"),
                     "OBP": st.column_config.NumberColumn(format="%.3f"),
                     "ISO": st.column_config.NumberColumn(format="%.3f"),
