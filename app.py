@@ -9,7 +9,7 @@ st.set_page_config(page_title="MLB Prop Analyser v2", page_icon="⚾", layout="w
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght=400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .stApp{background:#f7f6f2;}
 .metric-card{background:#fff;border-radius:12px;padding:14px 18px;border:1px solid #dcd9d5;
@@ -279,9 +279,9 @@ with st.sidebar:
     w_whip = st.slider("WHIP Weight", 0.1, 0.9, 0.45, 0.05)
     st.markdown("---")
     
-    # NEW: Added permanent Score Key legend to sidebar
+    # REVISED: Lowered the visual thresholds to match reality
     st.markdown("### 📊 Score Key")
-    st.markdown("🟢 **75+** : Premium Value\n🟡 **60-74** : Playable\n🔴 **<60** : Sub-optimal")
+    st.markdown("🟢 **60+** : Premium Value\n🟡 **45-59** : Playable\n🔴 **<45** : Sub-optimal")
     
     st.markdown("---")
     if st.button("Clear Cache"):
@@ -417,10 +417,10 @@ if load_btn:
                     best_market = max(flt, key=flt.get)
                     best_score  = flt[best_market]
                     
-                    # NEW: Dynamic Grade Evaluation
-                    if best_score >= 75:
+                    # REVISED: Dynamic Grade Evaluation mapping mathematically accurate distributions
+                    if best_score >= 60.0:
                         grade_badge = "🟢 Premium"
-                    elif best_score >= 60:
+                    elif best_score >= 45.0:
                         grade_badge = "🟡 Playable"
                     else:
                         grade_badge = "🔴 Sub-optimal"
@@ -497,7 +497,6 @@ if "auto_df" in st.session_state:
 
         st.info(f"Fangraphs: {fg_c} batters  |  MLB API: {mlb_c} batters  |  Confirmed lineups: {conf_c} batters")
 
-        # Added Grade to the main display lists
         SHOW = ["Game","Game Time BST","Batter","Order","PA","AVG","OBP","ISO","OPS","wRC+","Env Rating", "Pitcher Rating", "Grade", "Rationale"]
 
         all_t, game_t, t_hits, t_rbi, t_hr, t_runs, t_raw = st.tabs([
@@ -609,7 +608,6 @@ if "auto_df" in st.session_state:
                                 st.markdown(f"**{row['Batter']}**")
                                 st.caption(f"Slot: #{int(row['Order'])} | {row['Game']} 🕒 {row['Game Time BST']}")
                             with card_right:
-                                # Appended the Grade right under the primary metric on the cards
                                 st.metric(label="Score", value=f"{row['Best Score']:.1f}")
                                 st.markdown(f"**{row['Grade']}**")
                             
