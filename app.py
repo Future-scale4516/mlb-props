@@ -2,15 +2,14 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import requests as req
-from datetime import date
+from datetime import date, datetime, timedelta
 import time
 
 st.set_page_config(page_title="MLB Prop Analyser v2", page_icon="⚾", layout="wide")
 
-# Kept custom CSS for global fonts, app background, sidebar styling, and metric cards[cite: 3]
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght=400;500;600;700&display=swap');
 html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .stApp{background:#f7f6f2;}
 .metric-card{background:#fff;border-radius:12px;padding:14px 18px;border:1px solid #dcd9d5;
@@ -54,7 +53,6 @@ BALLPARKS = {
 }
 
 MARKET_COLORS = {"Hits/Runs":"#01696f","RBI":"#d19900","Home Run":"#a12c7b","Runs Scored":"#006494"}
-MARKET_BADGES = {"Hits/Runs":"badge-hits","RBI":"badge-rbi","Home Run":"badge-hr","Runs Scored":"badge-runs"}
 
 def safe_get(url, params=None):
     for attempt in range(3):
@@ -78,6 +76,16 @@ def fetch_schedule(target_date: str):
     for d in data.get("dates",[]):
         for g in d.get("games",[]):
             t = g.get("teams",{})
+            raw_date = g.get("gameDate", "")
+            bst_time_str = "TBD"
+            if raw_date:
+                try:
+                    utc_dt = datetime.strptime(raw_date, "%Y-%m-%dT%H:%M:%SZ")
+                    bst_dt = utc_dt + timedelta(hours=1)
+                    bst_time_str = bst_dt.strftime("%H:%M BST")
+                except:
+                    pass
+
             rows.append({
                 "gamePk":         g.get("gamePk"),
                 "status":         g.get("status",{}).get("detailedState"),
@@ -90,6 +98,8 @@ def fetch_schedule(target_date: str):
                 "home_prob_id":   t.get("home",{}).get("probablePitcher",{}).get("id"),
                 "home_prob_name": t.get("home",{}).get("probablePitcher",{}).get("fullName","TBD"),
                 "venue":          g.get("venue",{}).get("name",""),
+                "game_time_bst":  bst_time_str,
+                "game_date_raw":  raw_date,
             })
     return pd.DataFrame(rows)
 
@@ -211,7 +221,6 @@ def wx_modifier(temp, wind, dome):
 def order_factor(order):
     return {1:1.00,2:0.97,3:0.97,4:0.95,5:0.93,6:0.90,7:0.87,8:0.84,9:0.80}.get(int(order or 9),0.80)
 
-# UPDATED: Injected core logical criteria and hard veto thresholds directly into calculation engine[cite: 3]
 def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
                  order, era, whip, hr9, k9, park_factor, temp, wind, dome, use_adv, w_era, w_whip):
     env = park_factor * wx_modifier(temp, wind, dome)
@@ -236,7 +245,6 @@ def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
     hr_score        = round(power   * hrv * env * 95, 2)
     runs_score      = round(on_base * pv * run_of * k_adj * env * 105, 2)
 
-    # HARD MATCHUP ENGINE VETOES
     if iso < 0.160 or barrel < 0.06 or hr9 < 0.9:
         hr_score = 0.0
     if order > 6 or wrc_plus < 90:
@@ -270,6 +278,12 @@ with st.sidebar:
     w_era  = st.slider("ERA Weight",  0.1, 0.9, 0.55, 0.05)
     w_whip = st.slider("WHIP Weight", 0.1, 0.9, 0.45, 0.05)
     st.markdown("---")
+    
+    # NEW: Added permanent Score Key legend to sidebar
+    st.markdown("### 📊 Score Key")
+    st.markdown("🟢 **75+** : Premium Value\n🟡 **60-74** : Playable\n🔴 **<60** : Sub-optimal")
+    
+    st.markdown("---")
     if st.button("Clear Cache"):
         st.cache_data.clear()
         for k in ["auto_df"]:
@@ -288,7 +302,7 @@ with col_btn:
     load_btn = st.button("Load Today's Slate")
 with col_info:
     st.markdown("""
-    **Auto-loads:**  MLB schedule · probable pitchers · **all 500+ batters** (MLB Stats API) · Fangraphs advanced stats (if available) · confirmed lineups · live ballpark weather
+    **Auto-loads:** MLB schedule · probable pitchers · **all 500+ batters** (MLB Stats API) · Fangraphs advanced stats (if available) · confirmed lineups · live ballpark weather
     """)
 
 if load_btn:
@@ -333,10 +347,28 @@ if load_btn:
             away_pitch["name"] = g["away_prob_name"]
             home_pitch["name"] = g["home_prob_name"]
 
+            total_env = wx["factor"] * wx_modifier(wx["temp"], wx["wind"], wx["dome"])
+            if total_env >= 1.06:
+                env_symbol = "🟢 Hitter-Friendly"
+            elif total_env >= 0.97:
+                env_symbol = "🟡 Neutral"
+            else:
+                env_symbol = "🔴 Pitcher-Friendly"
+
             for side_label, player_ids, order_map, opp_pitch, conf in [
                 ("Away", away_ids, away_order_map, home_pitch, away_conf),
                 ("Home", home_ids, home_order_map, away_pitch, home_conf),
             ]:
+                p_era = opp_pitch.get("era", 4.5)
+                p_whip = opp_pitch.get("whip", 1.35)
+                
+                if p_era >= 4.5 or p_whip >= 1.35:
+                    p_rating = "🟢 Target"
+                elif p_era <= 3.4 and p_whip <= 1.20:
+                    p_rating = "🔴 Avoid"
+                else:
+                    p_rating = "🟡 Neutral"
+
                 for pid in player_ids:
                     pid = int(pid)
                     order = int(order_map.get(pid, 9) or 9)
@@ -384,9 +416,28 @@ if load_btn:
                     if not flt: continue
                     best_market = max(flt, key=flt.get)
                     best_score  = flt[best_market]
+                    
+                    # NEW: Dynamic Grade Evaluation
+                    if best_score >= 75:
+                        grade_badge = "🟢 Premium"
+                    elif best_score >= 60:
+                        grade_badge = "🟡 Playable"
+                    else:
+                        grade_badge = "🔴 Sub-optimal"
+
+                    if best_market == "Home Run":
+                        rationale = f"Elite power (ISO {iso_v:.3f}) matching up against a pitcher allowing {opp_pitch.get('homeRunsPer9', 1.2):.1f} HR/9."
+                    elif best_market == "RBI":
+                        rationale = f"Strong run-producer (wRC+ {wrc_plus}) hitting #{order} in the order with men likely on base."
+                    elif best_market == "Runs Scored":
+                        rationale = f"High on-base threat (OBP {obp_v:.3f}) batting #{order} facing a high-WHIP ({p_whip:.2f}) pitcher."
+                    else:
+                        rationale = f"Excellent contact profile (AVG {avg_v:.3f}) in a favourable offensive environment."
 
                     all_rows.append({
                         "Game":          g["away_team"] + " @ " + g["home_team"],
+                        "Game Datetime": g["game_date_raw"],
+                        "Game Time BST": g["game_time_bst"],
                         "Side":          side_label,
                         "Batter":        pname,
                         "Order":         order,
@@ -401,18 +452,22 @@ if load_btn:
                         "Barrel%":       round(barrel*100,1),
                         "Stats Source":  "Fangraphs" if use_adv else "MLB API",
                         "Opp Pitcher":   opp_pitch.get("name","TBD"),
+                        "Pitcher Rating": p_rating,
                         "Pitcher ERA":   opp_pitch.get("era",4.5),
                         "Pitcher WHIP":  opp_pitch.get("whip",1.35),
                         "Pitcher HR/9":  opp_pitch.get("homeRunsPer9",1.2),
                         "Pitcher K/9":   opp_pitch.get("strikeoutsPer9Inn",8.5),
                         "Venue":         wx["venue"],
                         "Park Factor":   wx["factor"],
+                        "Env Rating":    env_symbol,
                         "Temp":          wx["temp"],
                         "Wind":          wx["wind"],
                         "Dome":          wx["dome"],
                         **scores,
                         "Best Market":   best_market,
                         "Best Score":    best_score,
+                        "Grade":         grade_badge,
+                        "Rationale":     rationale,
                         "Lineup Status": "Confirmed" if conf else "Projected",
                     })
 
@@ -442,15 +497,15 @@ if "auto_df" in st.session_state:
 
         st.info(f"Fangraphs: {fg_c} batters  |  MLB API: {mlb_c} batters  |  Confirmed lineups: {conf_c} batters")
 
-        SHOW = ["Game","Batter","Order","PA","AVG","OBP","ISO","OPS","wRC+"]
+        # Added Grade to the main display lists
+        SHOW = ["Game","Game Time BST","Batter","Order","PA","AVG","OBP","ISO","OPS","wRC+","Env Rating", "Pitcher Rating", "Grade", "Rationale"]
 
-        # UPDATED: Injected Game by Game tab cleanly into UI architecture[cite: 3]
         all_t, game_t, t_hits, t_rbi, t_hr, t_runs, t_raw = st.tabs([
             "All Ranked", "🗂️ Game by Game", "Hits/Runs", "RBI", "Home Run", "Runs Scored", "Raw Data"
         ])
 
         with all_t:
-            disp = [c for c in SHOW + ["Best Market", "Best Score", "Lineup Status", "Stats Source"] if c in df.columns]
+            disp = [c for c in SHOW + ["Best Market", "Best Score", "Lineup Status"] if c in df.columns]
             st.dataframe(df[disp].reset_index(drop=True), use_container_width=True, hide_index=True,
                 column_config={
                     "Best Score": st.column_config.ProgressColumn("Best Score", min_value=0, max_value=float(df["Best Score"].max()), format="%.1f", color="#a12c7b"),
@@ -459,36 +514,40 @@ if "auto_df" in st.session_state:
                     "ISO": st.column_config.NumberColumn(format="%.3f"),
                 })
 
-        # NEW: The complete Game-by-Game accordion parsing layout engine
         with game_t:
             st.subheader("🗂️ Matchup Breakdown")
             st.caption("Expand a matchup below to view structural player rankings, confirmed lineups, and pitching variables for that specific game.")
             
-            unique_games = df["Game"].unique()
-            for game_matchup in unique_games:
+            sorted_games = df[["Game", "Game Datetime"]].drop_duplicates().sort_values("Game Datetime")
+            unique_chrono_games = sorted_games["Game"].tolist()
+            
+            for game_matchup in unique_chrono_games:
                 game_df = df[df["Game"] == game_matchup].sort_values("Order", ascending=True)
                 sample_row = game_df.iloc[0]
                 venue = sample_row["Venue"]
                 temp = int(sample_row["Temp"])
                 wind = int(sample_row["Wind"])
                 is_dome = sample_row["Dome"]
+                bst_time = sample_row["Game Time BST"]
+                env_badge = sample_row["Env Rating"]
                 
                 weather_str = "🏟️ Dome" if is_dome else f"🌡️ {temp}°F | 💨 {wind} mph"
                 lineup_badge = "✅ Confirmed" if sample_row["Lineup Status"] == "Confirmed" else "⏳ Projected"
                 
-                with st.expander(f"⚾ {game_matchup}  |  {venue} ({weather_str})  |  Lineups: {lineup_badge}"):
+                with st.expander(f"⚾ {game_matchup}  🕒 {bst_time}  |  {venue} ({weather_str})  |  Conditions: {env_badge}  |  Lineups: {lineup_badge}"):
                     col_away, col_home = st.columns(2)
                     
                     with col_away:
                         away_team_name = game_matchup.split(" @ ")[0]
                         away_df = game_df[game_df["Side"] == "Away"]
                         away_pitcher = away_df["Opp Pitcher"].iloc[0] if not away_df.empty else "TBD"
+                        away_p_rating = away_df["Pitcher Rating"].iloc[0] if not away_df.empty else ""
                         st.markdown(f"### 🚀 {away_team_name}")
-                        st.caption(f"Facing Pitcher: **{away_pitcher}**")
+                        st.caption(f"Facing Pitcher: **{away_pitcher}** ({away_p_rating})")
                         
                         if not away_df.empty:
                             st.dataframe(
-                                away_df[["Order", "Batter", "wRC+", "OBP", "ISO", "Best Market", "Best Score"]].reset_index(drop=True),
+                                away_df[["Order", "Batter", "wRC+", "OBP", "ISO", "Grade", "Best Market", "Best Score"]].reset_index(drop=True),
                                 use_container_width=True, hide_index=True,
                                 column_config={
                                     "Best Score": st.column_config.NumberColumn("Score", format="%.1f"),
@@ -503,12 +562,13 @@ if "auto_df" in st.session_state:
                         home_team_name = game_matchup.split(" @ ")[1]
                         home_df = game_df[game_df["Side"] == "Home"]
                         home_pitcher = home_df["Opp Pitcher"].iloc[0] if not home_df.empty else "TBD"
+                        home_p_rating = home_df["Pitcher Rating"].iloc[0] if not home_df.empty else ""
                         st.markdown(f"### 🏠 {home_team_name}")
-                        st.caption(f"Facing Pitcher: **{home_pitcher}**")
+                        st.caption(f"Facing Pitcher: **{home_pitcher}** ({home_p_rating})")
                         
                         if not home_df.empty:
                             st.dataframe(
-                                home_df[["Order", "Batter", "wRC+", "OBP", "ISO", "Best Market", "Best Score"]].reset_index(drop=True),
+                                home_df[["Order", "Batter", "wRC+", "OBP", "ISO", "Grade", "Best Market", "Best Score"]].reset_index(drop=True),
                                 use_container_width=True, hide_index=True,
                                 column_config={
                                     "Best Score": st.column_config.NumberColumn("Score", format="%.1f"),
@@ -519,7 +579,6 @@ if "auto_df" in st.session_state:
                         else:
                             st.info("No batter data met filter criteria for this side.")
 
-        # UPDATED: Refactored legacy HTML layout loop into pristine native containers
         for tab, market in [(t_hits,"Hits/Runs"),(t_rbi,"RBI"),(t_hr,"Home Run"),(t_runs,"Runs Scored")]:
             with tab:
                 sub = df[df["Best Market"]==market]
@@ -548,13 +607,17 @@ if "auto_df" in st.session_state:
                             card_left, card_right = st.columns([3, 1])
                             with card_left:
                                 st.markdown(f"**{row['Batter']}**")
-                                st.caption(f"Slot: #{int(row['Order'])} | {row['Game']} ({row['Side']})")
+                                st.caption(f"Slot: #{int(row['Order'])} | {row['Game']} 🕒 {row['Game Time BST']}")
                             with card_right:
+                                # Appended the Grade right under the primary metric on the cards
                                 st.metric(label="Score", value=f"{row['Best Score']:.1f}")
+                                st.markdown(f"**{row['Grade']}**")
                             
                             st.markdown(f"🔬 `wRC+: {row['wRC+']}` | `OBP: {row['OBP']:.3f}` | `ISO: {row['ISO']:.3f}`")
-                            st.markdown(f"🔥 `vs: {row['Opp Pitcher']} (ERA {row['Pitcher ERA']})`")
-                            st.markdown(f"🏟️ `{row['Venue']}` | `{int(row['Temp'])}°F` | Status: `{row['Lineup Status']}`")
+                            st.markdown(f"🔥 `vs: {row['Opp Pitcher']} (ERA {row['Pitcher ERA']})` | {row['Pitcher Rating']}")
+                            st.markdown(f"🏟️ `{row['Venue']}` | Conditions: `{row['Env Rating']}`")
+                            st.divider()
+                            st.caption(f"💡 **Why back him:** {row['Rationale']}")
 
         with t_raw:
             st.dataframe(df.reset_index(drop=True), use_container_width=True, hide_index=True)
