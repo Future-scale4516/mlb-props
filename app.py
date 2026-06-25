@@ -180,7 +180,6 @@ def fetch_active_roster(team_id: int):
                      "pos_type":pos.get("type"),"pos_abbr":pos.get("abbreviation")})
     return pd.DataFrame(rows)
 
-# MODIFIED: Now harvests live hits, runs, RBIs, and HRs straight from the boxscore
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_live_lineups(game_pk: int):
     data = safe_get(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
@@ -281,6 +280,8 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### Filters")
     min_avg  = st.slider("Min AVG",   0.100, 0.350, 0.180, 0.005, format="%.3f")
+    # NEW: OBP Slider
+    min_obp  = st.slider("Min OBP",   0.250, 0.400, 0.280, 0.005, format="%.3f")
     min_pa   = st.slider("Min PA",    0, 200, 30, 10)
     max_era  = st.slider("Max opp ERA", 1.5, 10.0, 10.0, 0.1)
     max_ord  = st.slider("Max Order", 1, 9, 9)
@@ -292,11 +293,37 @@ with st.sidebar:
     st.markdown("### Model Weights")
     w_era  = st.slider("ERA Weight",  0.1, 0.9, 0.55, 0.05)
     w_whip = st.slider("WHIP Weight", 0.1, 0.9, 0.45, 0.05)
-    st.markdown("---")
     
+    st.markdown("---")
     st.markdown("### 📊 Score Key")
     st.markdown("🟢 **70+** : Premium Value\n🟡 **48-69** : Playable\n🔴 **<48** : Sub-optimal")
     
+    # NEW: Expandable Stat Cheat Sheet
+    st.markdown("---")
+    st.markdown("### 📖 Stat Cheat Sheet")
+    with st.expander("View Elite Thresholds"):
+        st.markdown("""
+        **wRC+ (Overall Offence)**
+        * 100 = League Average
+        * 120+ = Great
+        * 140+ = Elite
+        
+        **ISO (Raw Power - HR Targets)**
+        * .140 = Average
+        * .200 = Great 
+        * .250+ = Elite Slugger
+        
+        **OBP (On-Base - Run Targets)**
+        * .320 = Average
+        * .350 = Great 
+        * .380+ = Elite Table-Setter
+        
+        **Pitcher Vulnerability**
+        * **HR/9:** > 1.30 is highly vulnerable
+        * **WHIP:** > 1.35 means heavy base traffic
+        * **K/9:** < 7.50 ensures balls put in play
+        """)
+
     st.markdown("---")
     if st.button("Clear Cache"):
         st.cache_data.clear()
@@ -354,7 +381,6 @@ if load_btn:
             away_ids = lineups["away"]["player_id"].tolist() if away_conf else away_batters["player_id"].tolist()
             home_ids = lineups["home"]["player_id"].tolist() if home_conf else home_batters["player_id"].tolist()
             
-            # Map order and live stats
             away_stats_map = {row["player_id"]: row for _, row in lineups["away"].iterrows()} if away_conf else {}
             home_stats_map = {row["player_id"]: row for _, row in lineups["home"].iterrows()} if home_conf else {}
 
@@ -400,6 +426,10 @@ if load_btn:
 
                     if base.get("plateAppearances",0) < min_pa: continue
                     if float(base.get("avg",0)) < min_avg: continue
+                    
+                    # NEW: Implement the OBP slider logic
+                    if float(base.get("obp",0)) < min_obp: continue
+                    
                     if opp_pitch.get("era",4.5) > max_era: continue
 
                     use_adv = False
@@ -452,13 +482,11 @@ if load_btn:
                     else:
                         rationale = f"Excellent contact profile (AVG {avg_v:.3f}) in a favourable offensive environment."
 
-                    # Extract live game stats
                     live_hits = player_live_data.get("live_hits", 0)
                     live_runs = player_live_data.get("live_runs", 0)
                     live_rbi = player_live_data.get("live_rbi", 0)
                     live_hr = player_live_data.get("live_hr", 0)
                     
-                    # Logic to resolve whether the bet has hit yet
                     is_final = game_status_label in ["Final", "Completed", "Game Over"]
                     bet_won = False
                     
@@ -539,7 +567,6 @@ if "auto_df" in st.session_state:
 
         SHOW = ["Game","Game Time BST","Batter","Order","AVG","OBP","ISO","wRC+","Env Rating", "Pitcher Rating", "Grade"]
 
-        # NEW TAB: Added ✅ Slip Tracker
         all_t, game_t, tracker_t, t_hits, t_rbi, t_hr, t_runs, t_raw = st.tabs([
             "All Ranked", "🗂️ Game by Game", "✅ Slip Tracker", "Hits/Runs", "RBI", "Home Run", "Runs Scored", "Raw Data"
         ])
@@ -636,12 +663,10 @@ if "auto_df" in st.session_state:
                         else:
                             st.info("No batter data met filter criteria for this side.")
 
-        # THE NEW SLIP TRACKER ENGINE
         with tracker_t:
             st.subheader("✅ Live Slip Tracker")
             st.caption("Tracks your top recommended bets in real-time. Hit the 'Load Today's Slate' button to fetch the latest pitch-by-pitch updates.")
             
-            # Filter the tracker to only show Playable or Premium bets so the list isn't cluttered
             tracker_df = df[df["Grade"].isin(["🟢 Premium", "🟡 Playable"])].copy()
             
             if tracker_df.empty:
