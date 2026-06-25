@@ -88,7 +88,7 @@ def fetch_schedule(target_date: str):
 
             rows.append({
                 "gamePk":         g.get("gamePk"),
-                "status":         g.get("status",{}).get("detailedState"),
+                "status":         g.get("status",{}).get("detailedState", "Scheduled"),
                 "away_team":      t.get("away",{}).get("team",{}).get("name"),
                 "home_team":      t.get("home",{}).get("team",{}).get("name"),
                 "away_team_id":   t.get("away",{}).get("team",{}).get("id"),
@@ -180,7 +180,8 @@ def fetch_active_roster(team_id: int):
                      "pos_type":pos.get("type"),"pos_abbr":pos.get("abbreviation")})
     return pd.DataFrame(rows)
 
-@st.cache_data(ttl=300, show_spinner=False)
+# MODIFIED: Now harvests live hits, runs, RBIs, and HRs straight from the boxscore
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_live_lineups(game_pk: int):
     data = safe_get(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
     teams = data.get("liveData",{}).get("boxscore",{}).get("teams",{})
@@ -195,7 +196,16 @@ def fetch_live_lineups(game_pk: int):
             if raw:
                 try: 
                     slot = int(raw) // 100
-                    rows.append({"player_id":pid,"name":p.get("person",{}).get("fullName",""),"order":slot})
+                    live_stats = p.get("stats", {}).get("batting", {})
+                    rows.append({
+                        "player_id": pid,
+                        "name": p.get("person",{}).get("fullName",""),
+                        "order": slot,
+                        "live_hits": live_stats.get("hits", 0),
+                        "live_runs": live_stats.get("runs", 0),
+                        "live_rbi": live_stats.get("rbi", 0),
+                        "live_hr": live_stats.get("homeRuns", 0)
+                    })
                 except: continue
         
         if rows:
@@ -343,8 +353,10 @@ if load_btn:
 
             away_ids = lineups["away"]["player_id"].tolist() if away_conf else away_batters["player_id"].tolist()
             home_ids = lineups["home"]["player_id"].tolist() if home_conf else home_batters["player_id"].tolist()
-            away_order_map = dict(zip(lineups["away"]["player_id"],lineups["away"]["order"])) if away_conf else {pid:i+1 for i,pid in enumerate(away_ids)}
-            home_order_map = dict(zip(lineups["home"]["player_id"],lineups["home"]["order"])) if home_conf else {pid:i+1 for i,pid in enumerate(home_ids)}
+            
+            # Map order and live stats
+            away_stats_map = {row["player_id"]: row for _, row in lineups["away"].iterrows()} if away_conf else {}
+            home_stats_map = {row["player_id"]: row for _, row in lineups["home"].iterrows()} if home_conf else {}
 
             away_pitch = fetch_pitcher_stats(g["away_prob_id"])
             home_pitch = fetch_pitcher_stats(g["home_prob_id"])
@@ -359,9 +371,11 @@ if load_btn:
             else:
                 env_symbol = "🔴 Pitcher-Friendly"
 
-            for side_label, player_ids, order_map, opp_pitch, conf in [
-                ("Away", away_ids, away_order_map, home_pitch, away_conf),
-                ("Home", home_ids, home_order_map, away_pitch, home_conf),
+            game_status_label = g["status"]
+
+            for side_label, player_ids, stats_map, opp_pitch, conf in [
+                ("Away", away_ids, away_stats_map, home_pitch, away_conf),
+                ("Home", home_ids, home_stats_map, away_pitch, home_conf),
             ]:
                 p_era = opp_pitch.get("era", 4.5)
                 p_whip = opp_pitch.get("whip", 1.35)
@@ -375,7 +389,8 @@ if load_btn:
 
                 for pid in player_ids:
                     pid = int(pid)
-                    order = int(order_map.get(pid, 9) or 9)
+                    player_live_data = stats_map.get(pid, {})
+                    order = int(player_live_data.get("order", 9) or 9)
                     if order > max_ord: continue
 
                     mlb_row = mlb_all[mlb_all["player_id"] == pid] if not mlb_all.empty else pd.DataFrame()
@@ -437,8 +452,31 @@ if load_btn:
                     else:
                         rationale = f"Excellent contact profile (AVG {avg_v:.3f}) in a favourable offensive environment."
 
+                    # Extract live game stats
+                    live_hits = player_live_data.get("live_hits", 0)
+                    live_runs = player_live_data.get("live_runs", 0)
+                    live_rbi = player_live_data.get("live_rbi", 0)
+                    live_hr = player_live_data.get("live_hr", 0)
+                    
+                    # Logic to resolve whether the bet has hit yet
+                    is_final = game_status_label in ["Final", "Completed", "Game Over"]
+                    bet_won = False
+                    
+                    if best_market == "Home Run" and live_hr >= 1: bet_won = True
+                    elif best_market == "RBI" and live_rbi >= 1: bet_won = True
+                    elif best_market == "Runs Scored" and live_runs >= 1: bet_won = True
+                    elif best_market == "Hits/Runs" and (live_hits + live_runs) >= 2: bet_won = True
+                    
+                    if bet_won:
+                        result_status = "✅ Won"
+                    elif not bet_won and is_final:
+                        result_status = "❌ Lost"
+                    else:
+                        result_status = "⏳ Pending"
+
                     all_rows.append({
                         "Game":          g["away_team"] + " @ " + g["home_team"],
+                        "Game Status":   game_status_label,
                         "Game Datetime": g["game_date_raw"],
                         "Game Time BST": g["game_time_bst"],
                         "Side":          side_label,
@@ -448,18 +486,12 @@ if load_btn:
                         "AVG":           round(avg_v,3),
                         "OBP":           round(obp_v,3),
                         "ISO":           round(iso_v,3),
-                        "OPS":           round(ops_v,3),
                         "wRC+":          wrc_plus,
-                        "K%":            round(k_pct*100,1),
-                        "HardHit%":      round(hard_hit*100,1),
-                        "Barrel%":       round(barrel*100,1),
                         "Stats Source":  "Fangraphs" if use_adv else "MLB API",
                         "Opp Pitcher":   opp_pitch.get("name","TBD"),
                         "Pitcher Rating": p_rating,
                         "Pitcher ERA":   opp_pitch.get("era",4.5),
                         "Pitcher WHIP":  opp_pitch.get("whip",1.35),
-                        "Pitcher HR/9":  opp_pitch.get("homeRunsPer9",1.2),
-                        "Pitcher K/9":   opp_pitch.get("strikeoutsPer9Inn",8.5),
                         "Venue":         wx["venue"],
                         "Park Factor":   wx["factor"],
                         "Env Rating":    env_symbol,
@@ -472,6 +504,11 @@ if load_btn:
                         "Grade":         grade_badge,
                         "Rationale":     rationale,
                         "Lineup Status": "Confirmed" if conf else "Projected",
+                        "Live Hits":     live_hits,
+                        "Live Runs":     live_runs,
+                        "Live RBI":      live_rbi,
+                        "Live HR":       live_hr,
+                        "Slip Result":   result_status
                     })
 
         if not all_rows:
@@ -500,16 +537,15 @@ if "auto_df" in st.session_state:
 
         st.info(f"Fangraphs: {fg_c} batters  |  MLB API: {mlb_c} batters  |  Confirmed lineups: {conf_c} batters")
 
-        SHOW = ["Game","Game Time BST","Batter","Order","PA","AVG","OBP","ISO","OPS","wRC+","Env Rating", "Pitcher Rating", "Grade", "Rationale"]
+        SHOW = ["Game","Game Time BST","Batter","Order","AVG","OBP","ISO","wRC+","Env Rating", "Pitcher Rating", "Grade"]
 
-        all_t, game_t, t_hits, t_rbi, t_hr, t_runs, t_raw = st.tabs([
-            "All Ranked", "🗂️ Game by Game", "Hits/Runs", "RBI", "Home Run", "Runs Scored", "Raw Data"
+        # NEW TAB: Added ✅ Slip Tracker
+        all_t, game_t, tracker_t, t_hits, t_rbi, t_hr, t_runs, t_raw = st.tabs([
+            "All Ranked", "🗂️ Game by Game", "✅ Slip Tracker", "Hits/Runs", "RBI", "Home Run", "Runs Scored", "Raw Data"
         ])
 
         with all_t:
             st.markdown("### 📋 Ranked Prop Targets")
-            
-            # NEW: The Multiselect Filter Bar
             f_col1, f_col2, f_col3 = st.columns(3)
             with f_col1:
                 sel_markets = st.multiselect("🎯 Filter by Market", options=df["Best Market"].unique(), default=df["Best Market"].unique())
@@ -518,14 +554,12 @@ if "auto_df" in st.session_state:
             with f_col3:
                 sel_status = st.multiselect("⏳ Lineup Status", options=df["Lineup Status"].unique(), default=df["Lineup Status"].unique())
             
-            # Apply user filters to the dataframe
             filtered_df = df[
                 (df["Best Market"].isin(sel_markets)) & 
                 (df["Grade"].isin(sel_grades)) &
                 (df["Lineup Status"].isin(sel_status))
             ]
             
-            # Safely calculate the max score for the progress bar scaling
             max_score = float(filtered_df["Best Score"].max()) if not filtered_df.empty else 100.0
             
             disp = [c for c in SHOW + ["Best Market", "Best Score", "Lineup Status"] if c in filtered_df.columns]
@@ -601,6 +635,28 @@ if "auto_df" in st.session_state:
                             )
                         else:
                             st.info("No batter data met filter criteria for this side.")
+
+        # THE NEW SLIP TRACKER ENGINE
+        with tracker_t:
+            st.subheader("✅ Live Slip Tracker")
+            st.caption("Tracks your top recommended bets in real-time. Hit the 'Load Today's Slate' button to fetch the latest pitch-by-pitch updates.")
+            
+            # Filter the tracker to only show Playable or Premium bets so the list isn't cluttered
+            tracker_df = df[df["Grade"].isin(["🟢 Premium", "🟡 Playable"])].copy()
+            
+            if tracker_df.empty:
+                st.info("No Playable or Premium bets available to track right now.")
+            else:
+                tracker_df["Target"] = tracker_df["Best Market"].apply(lambda x: "2+ (Hits+Runs)" if x == "Hits/Runs" else "1+ " + x)
+                tracker_df["Live Stats"] = "H:" + tracker_df["Live Hits"].astype(str) + " R:" + tracker_df["Live Runs"].astype(str) + " RBI:" + tracker_df["Live RBI"].astype(str) + " HR:" + tracker_df["Live HR"].astype(str)
+                
+                display_cols = ["Game Time BST", "Batter", "Game Status", "Best Market", "Target", "Live Stats", "Slip Result"]
+                
+                st.dataframe(
+                    tracker_df[display_cols].reset_index(drop=True), 
+                    use_container_width=True, 
+                    hide_index=True
+                )
 
         for tab, market in [(t_hits,"Hits/Runs"),(t_rbi,"RBI"),(t_hr,"Home Run"),(t_runs,"Runs Scored")]:
             with tab:
