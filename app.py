@@ -4,12 +4,12 @@ import requests as req
 from datetime import date, datetime, timedelta
 import time
 
-st.set_page_config(page_title="MLB Prop Value Matrix v1.0", page_icon="⚾", layout="wide")
+st.set_page_config(page_title="MLB Prop Value Matrix v1.1", page_icon="⚾", layout="wide")
 
 # ── MOBILE-FRIENDLY CSS ──
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght=400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .stApp{background:#f7f6f2;}
 .value-card {background:#ffffff; border-radius:12px; padding:16px; border:1px solid #e5e5e5; box-shadow:0 2px 4px rgba(0,0,0,0.02); margin-bottom:12px;}
@@ -43,8 +43,6 @@ def tank01_get(endpoint, api_key, params=None):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_daily_schedule_tank(target_date: str, api_key: str):
     data = tank01_get("getMLBGamesForDate", api_key, {"gameDate": target_date.replace("-", "")})
-    
-    # Explicitly define the column structure for fallback safety
     columns_blueprint = ["game_id", "status", "away_team", "home_team", "away_pitcher", "home_pitcher", "venue", "game_time_bst", "epoch"]
     
     if not data or "body" not in data:
@@ -56,7 +54,6 @@ def fetch_daily_schedule_tank(target_date: str, api_key: str):
         
     rows = []
     for g in games:
-        # Convert Tank01 epoch time to BST
         bst_time_str = "TBD"
         epoch = g.get("gameTimeEpoch")
         if epoch:
@@ -87,11 +84,10 @@ def fetch_daily_schedule_tank(target_date: str, api_key: str):
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_lineups_tank(target_date: str, api_key: str):
     data = tank01_get("getMLBLineups", api_key, {"gameDate": target_date.replace("-", "")})
-    if not data or "body" not in data:
-        return {}
+    if not data or "body" not in data: return {}
     lineups = data.get("body", {})
-    if not isinstance(lineups, dict):
-        return {}
+    if not isinstance(lineups, dict): return {}
+    
     out = {}
     for game_id, details in lineups.items():
         if not isinstance(details, dict): continue
@@ -102,7 +98,7 @@ def fetch_lineups_tank(target_date: str, api_key: str):
             
             rows = []
             for order_str, player_info in side_data.items():
-                if order_str == "pitcher": continue # Skip pitcher in batting order
+                if order_str == "pitcher": continue
                 try: order = int(order_str)
                 except: continue
                 
@@ -120,30 +116,23 @@ def fetch_lineups_tank(target_date: str, api_key: str):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_weather_tank(target_date: str, api_key: str):
     data = tank01_get("getMLBWeather", api_key, {"gameDate": target_date.replace("-", "")})
-    if not data or "body" not in data:
-        return {}
+    if not data or "body" not in data: return {}
     weather_dict = data.get("body", {})
-    if not isinstance(weather_dict, dict):
-        return {}
+    if not isinstance(weather_dict, dict): return {}
+    
     out = {}
     for game_id, details in weather_dict.items():
         if not isinstance(details, dict): continue
         w = details.get("weather", {})
         if not isinstance(w, dict): w = {}
-        try:
-            temp = float(w.get("temp", 72))
-        except:
-            temp = 72.0
-        try:
-            wind = float(w.get("wind", 8))
-        except:
-            wind = 8.0
+        try: temp = float(w.get("temp", 72))
+        except: temp = 72.0
+        try: wind = float(w.get("wind", 8))
+        except: wind = 8.0
         dome = str(w.get("dome", "false")).lower() == "true"
         
-        # Simple environment logic: High temp + wind = Batter friendly
         env_factor = 1.0 if dome else 1.0 + (temp-70)*0.003 + wind*0.004
         env_symbol = "🟢 Batter Friendly" if env_factor >= 1.05 else "🟡 50/50" if env_factor >= 0.98 else "🔴 Pitcher Friendly"
-        
         weather_str = "🏟️ Dome" if dome else f"🌡️ {int(temp)}°F | 💨 {int(wind)} mph"
         
         out[game_id] = {"factor": env_factor, "symbol": env_symbol, "desc": weather_str}
@@ -156,7 +145,6 @@ def fetch_mlb_historical_stats(season: int):
     rows = []
     splits = data.get("stats",[{}])[0].get("splits",[])
     
-    # Calculate league average OPS for wRC+ proxy
     total_ops, count = 0.0, 0
     for s in splits:
         ops_val = float(s.get("stat",{}).get("ops") or 0.0)
@@ -196,7 +184,7 @@ def fetch_pitcher_historical_stats(season: int):
 
 # ── SCORING & LOGIC ENGINE ──
 def score_batter(b_stats, p_stats, order, env_factor):
-    avg, obp, iso, wrc_plus, k_pct = b_stats["avg"], b_stats["obp"], b_stats["iso"], b_stats["wrc_plus"], b_stats["k_pct"]
+    avg, obp, iso, wrc_plus = b_stats["avg"], b_stats["obp"], b_stats["iso"], b_stats["wrc_plus"]
     era, whip, hr9, k9 = p_stats["era"], p_stats["whip"], p_stats["hr9"], p_stats["k9"]
     
     of  = {1:1.00,2:0.97,3:0.97,4:0.95,5:0.93,6:0.90,7:0.87,8:0.84,9:0.80}.get(order, 0.80)
@@ -204,15 +192,12 @@ def score_batter(b_stats, p_stats, order, env_factor):
     hrv = min(hr9/2.5,1.0)
     k_adj = 1.0 - min((k9-7.0)/14.0, 0.20)
     
-    # Core Algorithms
     hits_runs_score = round((avg*0.65 + obp*0.35) * pv * of * k_adj * env_factor * 280, 2)
     rbi_score       = round((avg*0.65 + obp*0.35) * pv * (1.0 + max(0,(5-order)*0.04)) * k_adj * env_factor * 260, 2)
     hr_score        = round(iso * hrv * env_factor * 280, 2)
     runs_score      = round(obp * pv * (1.0 + max(0,(4-order)*0.05)) * k_adj * env_factor * 280, 2)
 
-    # Logic Translation (The "Why")
     why_map = {}
-    
     if hr_score > 60:
         why_map["Home Run"] = f"Elite raw power (ISO .{iso:.3f}) facing a pitcher allowing {hr9:.1f} HR/9."
     elif iso > 0.200:
@@ -249,7 +234,7 @@ with st.sidebar:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
-st.title("⚾ MLB Value Matrix v1.0")
+st.title("⚾ MLB Value Matrix v1.1")
 st.caption("Powered by Tank01 Lineups & Official MLB Historical Maths")
 st.divider()
 
@@ -258,9 +243,11 @@ if st.button("Load Today's Slate", type="primary"):
         st.warning("⚠️ Please enter your Tank01 API Key in the sidebar.")
         st.stop()
         
-    with st.status("Assembling metrics from hybrid data stream...", expanded=True) as status:
+    # ── PROTECTION 1: Clear out any polluted browser session data before running ──
+    if "auto_df" in st.session_state:
+        del st.session_state["auto_df"]
         
-        # 1. Fetch Daily Context (Tank01)
+    with st.status("Assembling metrics from hybrid data stream...", expanded=True) as status:
         sched = fetch_daily_schedule_tank(str(sel_date), api_key_input)
         if sched.empty: 
             status.update(label="No scheduled games found for this date.", state="error")
@@ -270,7 +257,6 @@ if st.button("Load Today's Slate", type="primary"):
         lineups_dict = fetch_lineups_tank(str(sel_date), api_key_input)
         weather_dict = fetch_weather_tank(str(sel_date), api_key_input)
         
-        # 2. Fetch Historical Maths (MLB API)
         mlb_batters = fetch_mlb_historical_stats(sel_date.year)
         mlb_pitchers = fetch_pitcher_historical_stats(sel_date.year)
 
@@ -286,7 +272,6 @@ if st.button("Load Today's Slate", type="primary"):
             away_conf, home_conf = not l_data["away"].empty, not l_data["home"].empty
             lineup_badge = "✅ Confirmed" if (away_conf and home_conf) else "⏳ Projected/Awaiting"
 
-            # Match pitchers from Tank01 string to MLB stats via clean names
             a_p_clean = str(g["away_pitcher"]).lower().replace(".", "").replace("'", "")
             h_p_clean = str(g["home_pitcher"]).lower().replace(".", "").replace("'", "")
             
@@ -330,10 +315,13 @@ if st.button("Load Today's Slate", type="primary"):
             st.session_state["auto_df"] = pd.DataFrame(all_rows)
             status.update(label="Analytics matrices compiled successfully.", state="complete")
         else:
-            status.update(label="No historical datasets matched the active filter threshold.", state="error")
+            # ── PROTECTION 2: Hard gate stop if data output is empty to block downstream slicing ──
+            status.update(label="No historical datasets matched filters.", state="error")
+            st.error("⚠️ No players matched your specific filtering thresholds for today's active lineups. Try widening your filters in the sidebar.")
+            st.stop()
 
 # ── UI RENDERING ──
-if "auto_df" in st.session_state:
+if "auto_df" in st.session_state and not st.session_state["auto_df"].empty:
     df = st.session_state["auto_df"]
 
     tabs = st.tabs(["🏠 Home / Glossary", "🗂️ Daily Matchups", "🎯 Hits/Runs/RBI", "🏏 RBIs", "🏃‍♂️ Runs", "💥 Home Runs", "✅ Results Tracker"])
@@ -366,17 +354,15 @@ if "auto_df" in st.session_state:
                 st.write(f"**Conditions:** {g['Weather Str']}")
                 st.write(f"**Status:** {g['Lineup Badge']}")
 
-    # Render Mobile-Friendly Market Tabs
     market_map = {"🎯 Hits/Runs/RBI": ("Hits/Runs/RBI", "Why_Hits", "AVG"), "🏏 RBIs": ("RBI", "Why_RBI", "wRC+"), "🏃‍♂️ Runs": ("Runs Scored", "Why_Runs", "OBP"), "💥 Home Runs": ("Home Run", "Why_HR", "ISO")}
     
     for t_idx, (tab_name, data_tuple) in enumerate(market_map.items(), start=2):
         with tabs[t_idx]:
+            st.subheader(f"🏆 Top Picks: {data_tuple[0]}")
             m_col, why_col, stat_col = data_tuple
-            st.subheader(f"🏆 Top Picks: {m_col}")
             
             top_3 = df.sort_values(m_col, ascending=False).head(3)
             
-            # Mobile-Friendly Cards
             for _, row in top_3.iterrows():
                 st.markdown(f"""
                 <div class="value-card">
