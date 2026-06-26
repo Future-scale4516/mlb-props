@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 import time
 from fractions import Fraction
 
-st.set_page_config(page_title="MLB Prop & Game Analyser v4.1", page_icon="⚾", layout="wide")
+st.set_page_config(page_title="MLB Prop & Game Analyser v5", page_icon="⚾", layout="wide")
 
 st.markdown("""
 <style>
@@ -48,13 +48,11 @@ def decimal_to_fractional(dec):
     frac = Fraction(dec - 1.0).limit_denominator(20)
     return f"{frac.numerator}/{frac.denominator}"
 
-# ── API PATHWAY 1: HIGHLIGHTLY (METADATA & LINEUPS) ───────────────────────
+# ── API PATHWAY 1: HIGHLIGHTLY (METADATA, STATS & LINEUPS) ───────────────────
 def highlightly_get(endpoint, api_key, params=None):
-    url = f"https://sport-highlights-api.p.rapidapi.com/baseball/{endpoint}"
-    headers = {
-        "x-rapidapi-key": api_key,
-        "x-rapidapi-host": "sport-highlights-api.p.rapidapi.com"
-    }
+    """Hits the correct dedicated Highlightly MLB endpoint."""
+    url = f"https://baseball.highlightly.net/{endpoint}"
+    headers = {"x-rapidapi-key": api_key}
     for attempt in range(3):
         try:
             r = req.get(url, headers=headers, params=params, timeout=15)
@@ -67,13 +65,13 @@ def highlightly_get(endpoint, api_key, params=None):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_matches_highlightly(target_date: str, api_key: str):
-    data = highlightly_get("matches", api_key, {"leagueName": "MLB", "date": target_date})
+    data = highlightly_get("matches", api_key, {"leagueName": "MLB", "date": target_date, "limit": 100})
     rows = []
     matches = data.get("data", []) if isinstance(data, dict) else data
     for g in matches:
         rows.append({
             "gamePk": g.get("id"),
-            "status": g.get("state", "Scheduled"),
+            "status": g.get("state", {}).get("current", "Scheduled") if isinstance(g.get("state"), dict) else g.get("state", "Scheduled"),
             "away_team": g.get("awayTeamName", "Away"),
             "home_team": g.get("homeTeamName", "Home"),
             "game_time_bst": g.get("time", "TBD"),
@@ -84,15 +82,15 @@ def fetch_matches_highlightly(target_date: str, api_key: str):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_player_stats_highlightly(season: int, api_key: str):
-    data = highlightly_get("players", api_key, {"leagueName": "MLB", "season": season})
+    data = highlightly_get("players", api_key, {"leagueName": "MLB", "season": season, "limit": 2000})
     rows = []
     players = data.get("data", []) if isinstance(data, dict) else data
     lg_ops = 0.730 
     
     for p in players:
         stats = p.get("statistics", {})
-        slg, avg, obp = float(stats.get("slg", 0)), float(stats.get("avg", 0)), float(stats.get("obp", 0))
-        ops = float(stats.get("ops", 0))
+        slg, avg, obp = float(stats.get("slg") or 0), float(stats.get("avg") or 0), float(stats.get("obp") or 0)
+        ops = float(stats.get("ops") or 0)
         iso_val = round(slg - avg, 3)
         wrc_plus_proxy = int((ops / lg_ops) * 100) if lg_ops > 0 else 100
         
@@ -103,8 +101,8 @@ def fetch_player_stats_highlightly(season: int, api_key: str):
             "iso": iso_val, "wrc_plus": wrc_plus_proxy,
             "barrel_pct": min(0.22, max(0.01, iso_val * 0.45)),
             "hard_hit_pct": min(0.60, max(0.15, (ops * 0.45) + (iso_val * 0.2))),
-            "plateAppearances": int(stats.get("plateAppearances", 1)),
-            "k_pct": float(stats.get("strikeOuts", 0)) / max(1, float(stats.get("plateAppearances", 1)))
+            "plateAppearances": int(stats.get("plateAppearances") or 1),
+            "k_pct": float(stats.get("strikeOuts") or 0) / max(1, float(stats.get("plateAppearances") or 1))
         })
     return pd.DataFrame(rows)
 
@@ -122,7 +120,7 @@ def fetch_lineups_highlightly(match_id, api_key: str):
                 out[side] = pd.DataFrame(rows).sort_values("order")
     return out
 
-# ── API PATHWAY 2: THE-ODDS-API (MARKET DATA OVERLAY) ─────────────────────
+# ── API PATHWAY 2: THE-ODDS-API (UK MARKET DATA OVERLAY) ─────────────────────
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_live_odds_api(api_key: str):
     if not api_key or api_key.strip() == "": return {}
@@ -151,7 +149,17 @@ def fetch_weather(venue_name: str):
     meta = BALLPARKS.get(venue_name)
     if not meta: return {"temp":72,"wind":8,"factor":1.00,"dome":False,"venue":venue_name}
     if meta["dome"]: return {"temp":72,"wind":0,"factor":meta["factor"],"dome":True,"venue":venue_name}
-    return {"temp":72, "wind":8, "factor":meta["factor"], "dome":False, "venue":venue_name}
+    try:
+        data = safe_get("https://api.open-meteo.com/v1/forecast", {
+            "latitude":meta.get("lat", 39.0), "longitude":meta.get("lon", -95.0),
+            "current":"temperature_2m,wind_speed_10m",
+            "temperature_unit":"fahrenheit","wind_speed_unit":"mph"
+        })
+        c = data.get("current",{})
+        return {"temp":float(c.get("temperature_2m") or 72),"wind":float(c.get("wind_speed_10m") or 8),
+                "factor":meta["factor"],"dome":False,"venue":venue_name}
+    except:
+        return {"temp":72, "wind":8, "factor":meta["factor"], "dome":False, "venue":venue_name}
 
 def wx_modifier(temp, wind, dome):
     return 1.0 if dome else 1.0 + (temp-70)*0.003 + wind*0.004
@@ -205,11 +213,10 @@ st.divider()
 if st.button("Load Today's Slate", type="primary"):
     with st.status("Assembling metrics from hybrid data stream...", expanded=True) as status:
         sched = fetch_matches_highlightly(str(sel_date), hl_key)
-        if sched.empty: st.error("No games matched the criteria configuration."); st.stop()
+        if sched.empty: st.error("No games matched the criteria configuration. Check API keys or date."); st.stop()
 
         mlb_all = fetch_player_stats_highlightly(sel_date.year, hl_key)
         
-        # Fire request to the secondary layer
         odds_data = fetch_live_odds_api(odds_key)
         st.session_state["odds_data"] = odds_data
 
@@ -283,7 +290,7 @@ if "auto_df" in st.session_state:
     game_proj_dict = st.session_state.get("game_proj_dict", {})
     odds_data = st.session_state.get("odds_data", {})
 
-    market_tabs = ["🎯 Hits/Runs", "🏏 RBIs", "💥 Home Runs", "🏃‍♂️ Runs Scored", "🗂 " + "Matchups", "💰 Moneyline", "📈 Run Line", "📊 Totals"]
+    market_tabs = ["🎯 Hits/Runs", "🏏 RBIs", "💥 Home Runs", "🏃‍♂️ Runs Scored", "🗂️ Matchups", "💰 Moneyline", "📈 Run Line", "📊 Totals"]
     rendered_tabs = st.tabs(market_tabs)
 
     for idx, m_name in enumerate(["Hits/Runs", "RBI", "Home Run", "Runs Scored"]):
