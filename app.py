@@ -1,733 +1,376 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
 import requests as req
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timezone, timedelta
 import time
+from fractions import Fraction
 
-st.set_page_config(page_title="MLB Prop Analyser v2", page_icon="⚾", layout="wide")
+st.set_page_config(
+    page_title="MLB Prop Analyser",
+    page_icon="âš¾",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-html,body,[class*="css"]{font-family:'Inter',sans-serif;}
-.stApp{background:#f7f6f2;}
-.metric-card{background:#fff;border-radius:12px;padding:14px 18px;border:1px solid #dcd9d5;
-  box-shadow:0 2px 8px rgba(0,0,0,.05);text-align:center;margin-bottom:10px;}
-.metric-value{font-size:1.7rem;font-weight:700;color:#01696f;}
-.metric-label{font-size:.72rem;color:#7a7974;text-transform:uppercase;letter-spacing:.05em;margin-top:3px;}
-section[data-testid="stSidebar"]{background:#1c1b19;}
-section[data-testid="stSidebar"] *{color:#cdccca !important;}
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+.stApp { background-color: #0f1117; color: #e8e8e8; }
+section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
+.game-card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 0.75rem; }
+.game-card-header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 0.5rem; }
+.teams { font-size: 1.1rem; font-weight: 700; color: #ffffff; }
+.game-meta { font-size: 0.78rem; color: #8b949e; margin-top: 0.2rem; }
+.badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.03em; }
+.badge-hitter  { background:#1a3a2a;color:#3fb950;border:1px solid #3fb950; }
+.badge-neutral { background:#2a2a1a;color:#d29922;border:1px solid #d29922; }
+.badge-pitcher { background:#3a1a1a;color:#f85149;border:1px solid #f85149; }
+.badge-dome    { background:#1a2a3a;color:#58a6ff;border:1px solid #58a6ff; }
+.badge-confirmed  { background:#1a3a2a;color:#3fb950;border:1px solid #3fb950; }
+.badge-projected  { background:#2a2a2a;color:#8b949e;border:1px solid #8b949e; }
+.grade-premium    { color:#3fb950;font-weight:700; }
+.grade-playable   { color:#d29922;font-weight:600; }
+.grade-suboptimal { color:#8b949e; }
+.reason-box { background:#0d1117;border-left:3px solid #58a6ff;border-radius:0 6px 6px 0;padding:0.5rem 0.75rem;font-size:0.8rem;color:#8b949e;margin-top:0.4rem; }
+.section-title { font-size:0.7rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#8b949e;border-bottom:1px solid #30363d;padding-bottom:0.4rem;margin:1.25rem 0 0.75rem; }
+.stat-pill { display:inline-block;background:#21262d;border:1px solid #30363d;border-radius:6px;padding:2px 8px;font-size:0.75rem;color:#c9d1d9;margin:2px; }
+.threshold-box { background:#161b22;border:1px solid #30363d;border-radius:8px;padding:0.6rem 1rem;margin-bottom:0.75rem;font-size:0.8rem; }
+.model-explainer { background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:1rem 1.25rem;margin-bottom:1rem;font-size:0.82rem;color:#8b949e;line-height:1.7; }
+@media (max-width:768px) { .teams{font-size:1rem;} .game-card{padding:0.75rem;} }
+.stTabs [data-baseweb="tab-list"] { gap:4px;background:#161b22;border-radius:8px;padding:4px;flex-wrap:wrap; }
+.stTabs [data-baseweb="tab"] { background:transparent;color:#8b949e;border-radius:6px;font-size:0.82rem;padding:5px 12px; }
+.stTabs [aria-selected="true"] { background:#21262d !important;color:#ffffff !important; }
+[data-testid="metric-container"] { background:#161b22;border:1px solid #30363d;border-radius:10px;padding:0.75rem 1rem; }
 </style>
 """, unsafe_allow_html=True)
 
-BALLPARKS = {
-    "Oriole Park at Camden Yards": {"lat":39.2839,"lon":-76.6217,"factor":1.02,"dome":False},
-    "Yankee Stadium":              {"lat":40.8296,"lon":-73.9262,"factor":1.05,"dome":False},
-    "Fenway Park":                 {"lat":42.3467,"lon":-71.0972,"factor":1.08,"dome":False},
-    "Wrigley Field":               {"lat":41.9484,"lon":-87.6553,"factor":1.05,"dome":False},
-    "Rogers Centre":               {"lat":43.6414,"lon":-79.3894,"factor":1.05,"dome":True},
-    "Coors Field":                 {"lat":39.7559,"lon":-104.9942,"factor":1.38,"dome":False},
-    "loanDepot park":              {"lat":25.7781,"lon":-80.2197,"factor":0.93,"dome":True},
-    "Oracle Park":                 {"lat":37.7786,"lon":-122.3893,"factor":0.93,"dome":False},
-    "Petco Park":                  {"lat":32.7073,"lon":-117.1566,"factor":0.90,"dome":False},
-    "Citi Field":                  {"lat":40.7571,"lon":-73.8458,"factor":0.94,"dome":False},
-    "PNC Park":                    {"lat":40.4469,"lon":-80.0057,"factor":0.97,"dome":False},
-    "Tropicana Field":             {"lat":27.7683,"lon":-82.6534,"factor":0.94,"dome":True},
-    "Kauffman Stadium":            {"lat":39.0517,"lon":-94.4803,"factor":1.01,"dome":False},
-    "Rate Field":                  {"lat":41.8300,"lon":-87.6338,"factor":1.04,"dome":False},
-    "Truist Park":                 {"lat":33.8907,"lon":-84.4677,"factor":1.01,"dome":False},
-    "Angel Stadium":               {"lat":33.8003,"lon":-117.8827,"factor":1.00,"dome":False},
-    "T-Mobile Park":               {"lat":47.5914,"lon":-122.3325,"factor":0.94,"dome":False},
-    "Dodger Stadium":              {"lat":34.0739,"lon":-118.2400,"factor":0.97,"dome":False},
-    "Busch Stadium":               {"lat":38.6226,"lon":-90.1928,"factor":0.97,"dome":False},
-    "Progressive Field":           {"lat":41.4962,"lon":-81.6852,"factor":0.96,"dome":False},
-    "Comerica Park":               {"lat":42.3390,"lon":-83.0485,"factor":0.95,"dome":False},
-    "Globe Life Field":            {"lat":32.7473,"lon":-97.0847,"factor":1.02,"dome":True},
-    "Great American Ball Park":    {"lat":39.0979,"lon":-84.5081,"factor":1.10,"dome":False},
-    "American Family Field":       {"lat":43.0280,"lon":-87.9712,"factor":1.00,"dome":False},
-    "Chase Field":                 {"lat":33.4453,"lon":-112.0667,"factor":1.02,"dome":True},
-    "Nationals Park":              {"lat":38.8730,"lon":-77.0074,"factor":0.99,"dome":False},
-    "Las Vegas Ballpark":          {"lat":36.1318,"lon":-115.1439,"factor":1.12,"dome":False},
-    "Sutter Health Park":          {"lat":38.5802,"lon":-121.5014,"factor":1.05,"dome":False},
+# â”€â”€ CONSTANTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+RAPIDAPI_KEY = "46e23ff209mshb208e90af2f00d4p120983jsn38b0da2800d0"
+TANK01_HOST  = "tank01-mlb-live-in-game-real-time-statistics.p.rapidapi.com"
+TANK01_BASE  = f"https://{TANK01_HOST}"
+BST = timezone(timedelta(hours=1))
+ET  = timezone(timedelta(hours=-4))
+
+# Per-market recommended thresholds (evidence-based)
+THRESHOLDS = {
+    "Hits/Runs":   {"avg":0.240,"obp":0.310,"wrc":95,  "label":"Hits + Runs"},
+    "RBI":         {"avg":0.255,"obp":0.315,"wrc":100, "label":"RBI"},
+    "Home Run":    {"avg":0.230,"obp":0.300,"wrc":105, "label":"Home Run"},
+    "Runs Scored": {"avg":0.240,"obp":0.330,"wrc":90,  "label":"Runs Scored"},
 }
 
-MARKET_COLORS = {"Hits/Runs":"#01696f","RBI":"#d19900","Home Run":"#a12c7b","Runs Scored":"#006494"}
+BALLPARKS = {
+    "Oriole Park at Camden Yards":{"factor":1.02,"dome":False,"lat":39.2838,"lon":-76.6218},
+    "Yankee Stadium":             {"factor":1.05,"dome":False,"lat":40.8296,"lon":-73.9262},
+    "Fenway Park":                {"factor":1.08,"dome":False,"lat":42.3467,"lon":-71.0972},
+    "Wrigley Field":              {"factor":1.05,"dome":False,"lat":41.9484,"lon":-87.6553},
+    "Rogers Centre":              {"factor":1.05,"dome":True, "lat":43.6414,"lon":-79.3894},
+    "Coors Field":                {"factor":1.38,"dome":False,"lat":39.7560,"lon":-104.9942},
+    "loanDepot park":             {"factor":0.93,"dome":True, "lat":25.7781,"lon":-80.2197},
+    "Oracle Park":                {"factor":0.93,"dome":False,"lat":37.7786,"lon":-122.3893},
+    "Petco Park":                 {"factor":0.90,"dome":False,"lat":32.7076,"lon":-117.1570},
+    "Citi Field":                 {"factor":0.94,"dome":False,"lat":40.7571,"lon":-73.8458},
+    "PNC Park":                   {"factor":0.97,"dome":False,"lat":40.4469,"lon":-80.0057},
+    "Tropicana Field":            {"factor":0.94,"dome":True, "lat":27.7683,"lon":-82.6534},
+    "Kauffman Stadium":           {"factor":1.01,"dome":False,"lat":39.0517,"lon":-94.4803},
+    "Guaranteed Rate Field":      {"factor":1.04,"dome":False,"lat":41.8300,"lon":-87.6339},
+    "Truist Park":                {"factor":1.01,"dome":False,"lat":33.8908,"lon":-84.4678},
+    "Angel Stadium":              {"factor":1.00,"dome":False,"lat":33.8003,"lon":-117.8827},
+    "T-Mobile Park":              {"factor":0.94,"dome":False,"lat":47.5914,"lon":-122.3325},
+    "Dodger Stadium":             {"factor":0.97,"dome":False,"lat":34.0739,"lon":-118.2400},
+    "Busch Stadium":              {"factor":0.97,"dome":False,"lat":38.6226,"lon":-90.1928},
+    "Progressive Field":          {"factor":0.96,"dome":False,"lat":41.4962,"lon":-81.6852},
+    "Comerica Park":              {"factor":0.95,"dome":False,"lat":42.3390,"lon":-83.0485},
+    "Globe Life Field":           {"factor":1.02,"dome":True, "lat":32.7473,"lon":-97.0825},
+    "Great American Ball Park":   {"factor":1.10,"dome":False,"lat":39.0979,"lon":-84.5082},
+    "American Family Field":      {"factor":1.00,"dome":True, "lat":43.0280,"lon":-87.9712},
+    "Chase Field":                {"factor":1.02,"dome":True, "lat":33.4453,"lon":-112.0667},
+    "Nationals Park":             {"factor":0.99,"dome":False,"lat":38.8730,"lon":-77.0074},
+    "Sutter Health Park":         {"factor":1.05,"dome":False,"lat":38.5803,"lon":-121.5002},
+    "Globe Life Park":            {"factor":1.02,"dome":False,"lat":32.7473,"lon":-97.0825},
+}
 
-def safe_get(url, params=None):
+# â”€â”€ HELPERS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def to_bst(time_str, game_date):
+    try:
+        dt_et = datetime.strptime(f"{game_date} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=ET)
+        return dt_et.astimezone(BST).strftime("%H:%M BST")
+    except Exception:
+        try:
+            epoch = float(time_str)
+            dt_utc = datetime.utcfromtimestamp(epoch).replace(tzinfo=timezone.utc)
+            return dt_utc.astimezone(BST).strftime("%H:%M BST")
+        except Exception:
+            return str(time_str)
+
+def decimal_to_fractional(dec):
+    if not dec or dec <= 1.0: return "N/A"
+    if dec == 2.0: return "EVENS"
+    frac = Fraction(dec - 1.0).limit_denominator(20)
+    return f"{frac.numerator}/{frac.denominator}"
+
+def env_badge(label):
+    mapping = {
+        "Hitter-Friendly": "badge-hitter",
+        "Pitcher-Friendly":"badge-pitcher",
+        "Dome":            "badge-dome",
+    }
+    cls = mapping.get(label, "badge-neutral")
+    return f'<span class="badge {cls}">{label}</span>'
+
+def lineup_badge_html(label):
+    cls = "badge-confirmed" if label == "Confirmed" else "badge-projected"
+    return f'<span class="badge {cls}">{label} Lineup</span>'
+
+def wx_modifier(temp, wind, dome):
+    return 1.0 if dome else 1.0 + (temp - 70) * 0.003 + wind * 0.004
+
+def build_reason(row, market):
+    name    = row["Batter"]
+    avg     = row["AVG"];  obp = row["OBP"]
+    iso     = row["ISO"];  wrc = row["wRC+"]
+    env     = row["Env"];  venue = row["Venue"]
+    pitcher = row.get("Opp Pitcher","opposing starter")
+    era     = row.get("Pitcher ERA", 4.5)
+    hr9     = row.get("Pitcher HR9", 1.2)
+    order   = row["Order"]
+    ordinal = {1:"1st",2:"2nd",3:"3rd",4:"4th",5:"5th",
+               6:"6th",7:"7th",8:"8th",9:"9th"}.get(order,f"{order}th")
+    if market == "Hits/Runs":
+        return (f"{name} bats {ordinal} with AVG {avg:.3f} and OBP {obp:.3f}. "
+                f"wRC+ of {wrc} puts them {'above' if wrc>100 else 'at or below'} league average. "
+                f"{venue} is {env.lower()} â€” boosts contact/scoring potential.")
+    if market == "RBI":
+        return (f"Batting {ordinal} with wRC+ {wrc} and ISO {iso:.3f}. "
+                f"{pitcher} carries ERA {era:.2f} â€” expect runners on base. "
+                f"Slot and power profile make RBI a strong angle.")
+    if market == "Home Run":
+        return (f"ISO of {iso:.3f} reflects {'strong' if iso>0.18 else 'moderate'} raw power. "
+                f"Opposing pitcher {pitcher} carries HR/9 of {hr9:.2f}. "
+                f"{venue} park factor {'adds a further boost.' if env=='Hitter-Friendly' else 'is noted.'}")
+    if market == "Runs Scored":
+        return (f"OBP {obp:.3f} batting {ordinal} â€” ideal profile to score runs. "
+                f"wRC+ {wrc} confirms consistent offensive output. "
+                f"{'Hitter-friendly environment increases scoring probability.' if env=='Hitter-Friendly' else ''}")
+    return ""
+
+# â”€â”€ API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def tank01_get(endpoint, params=None):
+    headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": TANK01_HOST}
     for attempt in range(3):
         try:
-            r = req.get(url, params=params, timeout=30)
+            r = req.get(f"{TANK01_BASE}/{endpoint}", headers=headers, params=params, timeout=15)
             r.raise_for_status()
             return r.json()
-        except Exception as e:
-            if attempt == 2:
-                return {}
-            time.sleep(1)
+        except Exception:
+            if attempt == 2: return {}
+            time.sleep(1.5)
     return {}
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_schedule(target_date: str):
-    data = safe_get("https://statsapi.mlb.com/api/v1/schedule", {
-        "sportId":1, "date":target_date,
-        "hydrate":"probablePitcher,team,venue,linescore"
-    })
-    rows = []
-    for d in data.get("dates",[]):
-        for g in d.get("games",[]):
-            t = g.get("teams",{})
-            raw_date = g.get("gameDate", "")
-            bst_time_str = "TBD"
-            if raw_date:
-                try:
-                    utc_dt = datetime.strptime(raw_date, "%Y-%m-%dT%H:%M:%SZ")
-                    bst_dt = utc_dt + timedelta(hours=1)
-                    bst_time_str = bst_dt.strftime("%H:%M BST")
-                except:
-                    pass
+def mlb_api(endpoint, params=None):
+    try:
+        r = req.get(f"https://statsapi.mlb.com/api/v1/{endpoint}", params=params, timeout=12)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return {}
 
-            rows.append({
-                "gamePk":         g.get("gamePk"),
-                "status":         g.get("status",{}).get("detailedState", "Scheduled"),
-                "away_team":      t.get("away",{}).get("team",{}).get("name"),
-                "home_team":      t.get("home",{}).get("team",{}).get("name"),
-                "away_team_id":   t.get("away",{}).get("team",{}).get("id"),
-                "home_team_id":   t.get("home",{}).get("team",{}).get("id"),
-                "away_prob_id":   t.get("away",{}).get("probablePitcher",{}).get("id"),
-                "away_prob_name": t.get("away",{}).get("probablePitcher",{}).get("fullName","TBD"),
-                "home_prob_id":   t.get("home",{}).get("probablePitcher",{}).get("id"),
-                "home_prob_name": t.get("home",{}).get("probablePitcher",{}).get("fullName","TBD"),
-                "venue":          g.get("venue",{}).get("name",""),
-                "game_time_bst":  bst_time_str,
-                "game_date_raw":  raw_date,
-            })
-    return pd.DataFrame(rows)
+def safe_get(url, params=None):
+    try:
+        r = req.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return {}
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_all_mlb_batting_stats(season: int):
-    data = safe_get("https://statsapi.mlb.com/api/v1/stats", {
-        "stats":"season", "group":"hitting", "season":season,
-        "sportId":1, "playerPool":"ALL", "limit":2000,
-    })
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_games(game_date: str):
+    data = tank01_get("getMLBGamesForDate", {"gameDate": game_date})
+    body = data.get("body", [])
+    if isinstance(body, dict): body = list(body.values())
     rows = []
-    for split in data.get("stats",[{}])[0].get("splits",[]):
-        p   = split.get("player",{})
-        t   = split.get("team",{})
-        stat = split.get("stat",{})
-        slg = float(stat.get("slg") or 0)
-        avg = float(stat.get("avg") or 0)
-        obp = float(stat.get("obp") or 0)
-        so  = int(stat.get("strikeOuts") or 0)
-        pa  = int(stat.get("plateAppearances") or 1)
+    for g in body:
         rows.append({
-            "player_id":  int(p.get("id",0)),
-            "name":       p.get("fullName",""),
-            "team_id":    int(t.get("id",0)),
-            "avg":  avg, "obp":  obp, "slg":  slg,
-            "ops":  float(stat.get("ops") or 0),
-            "iso":  round(slg - avg, 3),
-            "hr":   int(stat.get("homeRuns") or 0),
-            "rbi":  int(stat.get("rbi") or 0),
-            "games":int(stat.get("gamesPlayed") or 0),
-            "strikeOuts":       so,
-            "baseOnBalls":      int(stat.get("baseOnBalls") or 0),
-            "plateAppearances": pa,
-            "k_pct":            round(so / pa, 4) if pa > 0 else 0.22,
+            "gameID":     g.get("gameID",""),
+            "away_team":  g.get("away",""),
+            "home_team":  g.get("home",""),
+            "away_abv":   g.get("awayTeam", g.get("away","")),
+            "home_abv":   g.get("homeTeam", g.get("home","")),
+            "game_time":  g.get("gameTime","TBD"),
+            "venue":      g.get("ballpark", g.get("venue","")),
+            "status":     g.get("gameStatus","Scheduled"),
+            "away_score": g.get("awayScore",""),
+            "home_score": g.get("homeScore",""),
         })
     return pd.DataFrame(rows)
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_fangraphs_stats(season: int):
-    try:
-        from pybaseball import batting_stats
-        df = batting_stats(season, qual=50)
-        col_map = {"Name":"name","AVG":"avg","OBP":"obp","SLG":"slg","ISO":"iso",
-                   "wRC+":"wrc_plus","K%":"k_pct","BB%":"bb_pct",
-                   "HardHit%":"hard_hit_pct","Barrel%":"barrel_pct","HR":"hr","G":"games"}
-        df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
-        for pct in ["k_pct","bb_pct","hard_hit_pct","barrel_pct"]:
-            if pct in df.columns and df[pct].max() > 1:
-                df[pct] = df[pct] / 100
-        return df
-    except:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_pitcher_stats(pitcher_id):
-    if not pitcher_id or pd.isna(pitcher_id):
-        return {"era":4.50,"whip":1.35,"homeRunsPer9":1.20,"strikeoutsPer9Inn":8.5,"name":"TBD"}
-    data = safe_get(f"https://statsapi.mlb.com/api/v1/people/{int(pitcher_id)}", {
-        "hydrate": f"stats(group=[pitching],type=[season],season={date.today().year})"
-    })
-    person = data.get("people",[{}])[0]
-    splits = person.get("stats",[{}])[0].get("splits",[{}]) if person.get("stats") else [{}]
-    stat = splits[0].get("stat",{}) if splits else {}
-    return {
-        "name":              person.get("fullName","TBD"),
-        "era":               float(stat.get("era") or 4.50),
-        "whip":              float(stat.get("whip") or 1.35),
-        "homeRunsPer9":      float(stat.get("homeRunsPer9") or 1.20),
-        "strikeoutsPer9Inn": float(stat.get("strikeoutsPer9Inn") or 8.50),
-    }
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_active_roster(team_id: int):
-    data = safe_get(f"https://statsapi.mlb.com/api/v1/teams/{int(team_id)}/roster", {"rosterType":"active"})
-    rows = []
-    for r in data.get("roster",[]):
-        p = r.get("person",{}); pos = r.get("position",{})
-        rows.append({"player_id":p.get("id"),"name":p.get("fullName"),
-                     "pos_type":pos.get("type"),"pos_abbr":pos.get("abbreviation")})
-    return pd.DataFrame(rows)
-
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_live_lineups(game_pk: int):
-    data = safe_get(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
-    teams = data.get("liveData",{}).get("boxscore",{}).get("teams",{})
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_probable_pitchers(game_date: str):
+    data = mlb_api("schedule", {"sportId":1,"date":game_date,"hydrate":"probablePitcher(note),team,linescore"})
     out = {}
-    for side in ["away","home"]:
-        team  = teams.get(side,{})
-        pmap  = team.get("players",{})
-        rows = []
-        for pid in (team.get("batters",[]) or []):
-            p = pmap.get(f"ID{pid}",{})
-            raw = p.get("battingOrder")
-            if raw:
-                try: 
-                    slot = int(raw) // 100
-                    live_stats = p.get("stats", {}).get("batting", {})
-                    rows.append({
-                        "player_id": pid,
-                        "name": p.get("person",{}).get("fullName",""),
-                        "order": slot,
-                        "live_hits": live_stats.get("hits", 0),
-                        "live_runs": live_stats.get("runs", 0),
-                        "live_rbi": live_stats.get("rbi", 0),
-                        "live_hr": live_stats.get("homeRuns", 0)
-                    })
-                except: continue
-        
-        if rows:
-            out[side] = pd.DataFrame(rows).sort_values("order")
-        else:
-            out[side] = pd.DataFrame() 
+    for d in data.get("dates",[]):
+        for g in d.get("games",[]):
+            pk   = g.get("gamePk")
+            away = g.get("teams",{}).get("away",{})
+            home = g.get("teams",{}).get("home",{})
+            out[pk] = {
+                "away_name":       away.get("team",{}).get("name",""),
+                "home_name":       home.get("team",{}).get("name",""),
+                "away_pitcher":    away.get("probablePitcher",{}).get("fullName","TBD"),
+                "home_pitcher":    home.get("probablePitcher",{}).get("fullName","TBD"),
+                "away_pitcher_id": away.get("probablePitcher",{}).get("id"),
+                "home_pitcher_id": home.get("probablePitcher",{}).get("id"),
+            }
+    return out
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_pitcher_stats(pitcher_id):
+    if not pitcher_id:
+        return {"era":4.50,"whip":1.35,"hr9":1.20,"k9":8.5,"fip":4.50}
+    data = mlb_api(f"people/{pitcher_id}/stats", {"stats":"season","group":"pitching"})
+    try:
+        s = data["stats"][0]["splits"][0]["stat"]
+        era  = float(s.get("era")  or 4.50)
+        whip = float(s.get("whip") or 1.35)
+        hr9  = float(s.get("homeRunsPer9") or s.get("hrsPer9Inn") or 1.20)
+        k9   = float(s.get("strikeoutsPer9Inn") or 8.5)
+        bb9  = float(s.get("walksPer9Inn") or 3.2)
+        # Simplified FIP proxy
+        fip  = round((13*hr9 + 3*bb9 - 2*k9) / 9 + 3.20, 2)
+        return {"era":era,"whip":whip,"hr9":hr9,"k9":k9,"fip":fip}
+    except Exception:
+        return {"era":4.50,"whip":1.35,"hr9":1.20,"k9":8.5,"fip":4.50}
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_mlb_lineups(game_date: str):
+    data = mlb_api("schedule", {"sportId":1,"date":game_date,"hydrate":"lineups,team"})
+    out = {}
+    for d in data.get("dates",[]):
+        for g in d.get("games",[]):
+            pk      = g.get("gamePk")
+            lineups = g.get("lineups",{})
+            out[pk] = {
+                "away":[{"id":str(p.get("id","")),"name":p.get("fullName",""),"order":i+1}
+                        for i,p in enumerate(lineups.get("awayPlayers",[]))],
+                "home":[{"id":str(p.get("id","")),"name":p.get("fullName",""),"order":i+1}
+                        for i,p in enumerate(lineups.get("homePlayers",[]))],
+            }
     return out
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_weather(venue_name: str):
-    meta = BALLPARKS.get(venue_name)
+def fetch_roster(team_abv: str, season: int):
+    data   = tank01_get("getMLBTeamRoster", {"teamAbv":team_abv,"season":str(season),"getStats":"true"})
+    body   = data.get("body",{}) or {}
+    roster = body.get("roster",[])
+    rows   = []
+    for p in roster:
+        stats   = p.get("stats",{}) or {}
+        ab      = float(stats.get("AB") or p.get("AB") or 1)
+        hits    = float(stats.get("H")  or p.get("H")  or 0)
+        bb      = float(stats.get("BB") or p.get("BB") or 0)
+        hbp     = float(stats.get("HBP") or 0)
+        sf      = float(stats.get("SF")  or 0)
+        hr      = float(stats.get("HR")  or p.get("HR") or 0)
+        doubles = float(stats.get("2B")  or p.get("2B") or 0)
+        triples = float(stats.get("3B")  or p.get("3B") or 0)
+        pa      = ab + bb + hbp + sf
+        avg_d   = stats.get("avg") or stats.get("battingAvg") or p.get("avg")
+        obp_d   = stats.get("obp") or stats.get("onBasePct")  or p.get("obp")
+        slg_d   = stats.get("slg") or stats.get("slugPct")    or p.get("slg")
+        avg = float(avg_d) if avg_d else (round(hits/ab,3) if ab>1 else 0.0)
+        obp = float(obp_d) if obp_d else (round((hits+bb+hbp)/pa,3) if pa>1 else 0.0)
+        tb  = hits + doubles + (2*triples) + (3*hr)
+        slg = float(slg_d) if slg_d else (round(tb/ab,3) if ab>1 else 0.0)
+        iso = round(max(slg - avg, 0), 3)
+        ops = round(obp + slg, 3)
+        wrc = int((ops / 0.730) * 100) if ops > 0 else 100
+        rows.append({
+            "player_id":    str(p.get("playerID","")),
+            "name":         p.get("longName", p.get("shortName","Unknown")),
+            "pos":          p.get("pos",""),
+            "avg":avg,"obp":obp,"slg":slg,"ops":ops,"iso":iso,"wrc_plus":wrc,
+            "barrel_pct":   min(0.22, max(0.01, iso * 0.45)),
+            "hard_hit_pct": min(0.60, max(0.15, (ops * 0.45) + (iso * 0.2))),
+            "ab":int(ab),"hr":int(hr),
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_weather(venue: str):
+    meta = BALLPARKS.get(venue)
     if not meta:
-        return {"temp":72,"wind":8,"factor":1.00,"dome":False,"venue":venue_name}
+        return {"temp":72,"wind":8,"wind_dir":"","factor":1.00,"dome":False}
     if meta["dome"]:
-        return {"temp":72,"wind":0,"factor":meta["factor"],"dome":True,"venue":venue_name}
-    data = safe_get("https://api.open-meteo.com/v1/forecast", {
-        "latitude":meta["lat"],"longitude":meta["lon"],
-        "current":"temperature_2m,wind_speed_10m",
-        "temperature_unit":"fahrenheit","wind_speed_unit":"mph"
-    })
-    c = data.get("current",{})
-    return {"temp":float(c.get("temperature_2m") or 72),"wind":float(c.get("wind_speed_10m") or 8),
-            "factor":meta["factor"],"dome":False,"venue":venue_name}
+        return {"temp":72,"wind":0,"wind_dir":"","factor":meta["factor"],"dome":True}
+    try:
+        d = safe_get("https://api.open-meteo.com/v1/forecast", {
+            "latitude":meta["lat"],"longitude":meta["lon"],
+            "current":"temperature_2m,wind_speed_10m,wind_direction_10m",
+            "temperature_unit":"fahrenheit","wind_speed_unit":"mph"
+        })
+        c = d.get("current",{})
+        deg = float(c.get("wind_direction_10m") or 0)
+        dirs = ["N","NE","E","SE","S","SW","W","NW"]
+        wind_dir = dirs[int((deg+22.5)//45)%8]
+        return {"temp":float(c.get("temperature_2m") or 72),
+                "wind":float(c.get("wind_speed_10m") or 8),
+                "wind_dir":wind_dir,"factor":meta["factor"],"dome":False}
+    except Exception:
+        return {"temp":72,"wind":8,"wind_dir":"","factor":meta["factor"],"dome":False}
 
-def wx_modifier(temp, wind, dome):
-    return 1.0 if dome else 1.0 + (temp-70)*0.003 + wind*0.004
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_odds(api_key: str):
+    if not api_key or not api_key.strip(): return {}
+    try:
+        r = req.get("https://api.the-odds-api.com/v4/sports/baseball_mlb/odds", params={
+            "apiKey":api_key,"regions":"uk","markets":"h2h,spreads,totals",
+            "bookmakers":"williamhill,paddypower,betfair,bet365,skybet","oddsFormat":"decimal"
+        }, timeout=15)
+        r.raise_for_status()
+        res = r.json()
+        if isinstance(res, list):
+            return {f"{i.get('away_team')} @ {i.get('home_team')}": i.get("bookmakers",[]) for i in res}
+        return {}
+    except Exception:
+        return {}
 
-def order_factor(order):
-    return {1:1.00,2:0.97,3:0.97,4:0.95,5:0.93,6:0.90,7:0.87,8:0.84,9:0.80}.get(int(order or 9),0.80)
+# â”€â”€ SCORING MODEL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def score_batter(avg, obp, slg, iso, wrc, hh, barrel, order,
+                 era, whip, hr9, k9, env_mod):
+    """
+    Returns dict of market scores 0-100.
 
-def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
-                 order, era, whip, hr9, k9, park_factor, temp, wind, dome, use_adv, w_era, w_whip):
-    env = park_factor * wx_modifier(temp, wind, dome)
-    of  = order_factor(order)
-    pv  = min(era/7.0,1.0)*w_era + min(max((whip-0.8)/1.2,0.0),1.0)*w_whip
-    hrv = min(hr9/2.5,1.0)
-    k_adj = 1.0 - min((k9-7.0)/14.0, 0.20)
-    rbi_of  = 1.0 + max(0,(5-order)*0.04)
-    run_of  = 1.0 + max(0,(4-order)*0.05)
-    
-    if use_adv:
-        contact = avg*0.35 + obp*0.30 + (wrc_plus/200)*0.25 + (1-k_pct)*0.10
-        power   = iso*0.40 + hard_hit*0.35 + barrel*0.25
-        on_base = obp * (wrc_plus/100)
-    else:
-        contact = avg*0.65 + obp*0.35
-        power   = max(0.05, slg - avg)
-        on_base = obp
-        
-    hits_runs_score = round(contact * pv * of * k_adj * env * 280, 2)
-    rbi_score       = round(contact * pv * rbi_of * k_adj * env * 260, 2)
-    hr_score        = round(power   * hrv * env * 280, 2)
-    runs_score      = round(on_base * pv * run_of * k_adj * env * 280, 2)
+    Components:
+      contact_score  = weighted combo of AVG, OBP, wRC+ (how often batter reaches)
+      pitcher_vuln   = ERA + WHIP scaled 0-1 (higher = worse pitcher = better for batter)
+      order_factor   = positional multiplier (leadoff 1.0 â†’ 9-hole 0.80)
+      k_adj          = strikeout rate penalty (high K9 pitchers hurt contact scores)
+      park_mod       = env_mod (park factor Ã— weather modifier)
+    """
+    order_factor = {1:1.00,2:0.97,3:0.97,4:0.95,5:0.93,
+                    6:0.90,7:0.87,8:0.84,9:0.80}.get(order, 0.80)
+    # Pitcher vulnerability 0-1: league avg ERA ~4.20, WHIP ~1.30
+    era_vuln  = min(era  / 6.5, 1.0)  # 6.5 = very bad ERA ceiling
+    whip_vuln = min(max((whip - 0.85) / 1.30, 0.0), 1.0)
+    pitcher_vuln = era_vuln * 0.60 + whip_vuln * 0.40
 
-    if iso < 0.130 or barrel < 0.04 or hr9 < 0.7:
-        hr_score = 0.0
-    if order > 7 or wrc_plus < 80:
-        rbi_score = 0.0
-    if order > 5 or obp < 0.290:
-        runs_score = 0.0
+    # Strikeout adjustment â€” K9 above 9 starts penalising contact
+    k_adj = 1.0 - min(max((k9 - 9.0) / 10.0, 0.0), 0.18)
 
-    return {
-        "Hits/Runs":   hits_runs_score,
-        "RBI":         rbi_score,
-        "Home Run":    hr_score,
-        "Runs Scored": runs_score,
-    }
+    # --- Market scores ---
+    # Hits + Runs: contact + OBP Ã— pitcher vulnerability Ã— order Ã— park
+    contact = avg * 0.35 + obp * 0.30 + (wrc / 200.0) * 0.25 + 0.78 * 0.10
+    hs = round(contact * pitcher_vuln * order_factor * k_adj * env_mod * 290, 2)
 
-# ── SIDEBAR ──────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## ⚾ MLB Props v2")
-    sel_date = st.date_input("Slate Date", value=date.today())
-    st.markdown("---")
-    st.markdown("### Filters")
-    min_avg  = st.slider("Min AVG",   0.100, 0.350, 0.180, 0.005, format="%.3f")
-    # NEW: OBP Slider
-    min_obp  = st.slider("Min OBP",   0.250, 0.400, 0.280, 0.005, format="%.3f")
-    min_pa   = st.slider("Min PA",    0, 200, 30, 10)
-    max_era  = st.slider("Max opp ERA", 1.5, 10.0, 10.0, 0.1)
-    max_ord  = st.slider("Max Order", 1, 9, 9)
-    st.markdown("### Markets")
-    s_hits = st.checkbox("Hits/Runs",   True)
-    s_rbi  = st.checkbox("RBI",         True)
-    s_hr   = st.checkbox("Home Run",    True)
-    s_runs = st.checkbox("Runs Scored", True)
-    st.markdown("### Model Weights")
-    w_era  = st.slider("ERA Weight",  0.1, 0.9, 0.55, 0.05)
-    w_whip = st.slider("WHIP Weight", 0.1, 0.9, 0.45, 0.05)
-    
-    st.markdown("---")
-    st.markdown("### 📊 Score Key")
-    st.markdown("🟢 **70+** : Premium Value\n🟡 **48-69** : Playable\n🔴 **<48** : Sub-optimal")
-    
-    # NEW: Expandable Stat Cheat Sheet
-    st.markdown("---")
-    st.markdown("### 📖 Stat Cheat Sheet")
-    with st.expander("View Elite Thresholds"):
-        st.markdown("""
-        **wRC+ (Overall Offence)**
-        * 100 = League Average
-        * 120+ = Great
-        * 140+ = Elite
-        
-        **ISO (Raw Power - HR Targets)**
-        * .140 = Average
-        * .200 = Great 
-        * .250+ = Elite Slugger
-        
-        **OBP (On-Base - Run Targets)**
-        * .320 = Average
-        * .350 = Great 
-        * .380+ = Elite Table-Setter
-        
-        **Pitcher Vulnerability**
-        * **HR/9:** > 1.30 is highly vulnerable
-        * **WHIP:** > 1.35 means heavy base traffic
-        * **K/9:** < 7.50 ensures balls put in play
-        """)
+    # RBI: power + situational hitting Ã— pitcher vuln Ã— order (3-5 hitters favoured)
+    rbi_order = max(0, 1.0 - abs(order - 4) * 0.06)
+    power     = iso * 0.40 + hh * 0.35 + barrel * 0.25
+    rs = round(power * pitcher_vuln * (0.70 + rbi_order * 0.30) * k_adj * env_mod * 270, 2)
 
-    st.markdown("---")
-    if st.button("Clear Cache"):
-        st.cache_data.clear()
-        for k in ["auto_df"]:
-            if k in st.session_state: del st.session_state[k]
-        st.rerun()
+    # Home Run: pure power Ã— HR/9 of pitcher Ã— park
+    hr9_vuln = min(hr9 / 2.5, 1.0)
+    hr = round(power * hr9_vuln * env_mod * 290, 2)
 
-allowed_markets = [m for m,s in [
-    ("Hits/Runs",s_hits),("RBI",s_rbi),("Home Run",s_hr),("Runs Scored",s_runs)] if s]
-
-st.title("⚾ MLB Prop Analyser v2")
-st.caption("Auto-fetches every MLB batter, probable pitchers, confirmed lineups and live weather.")
-st.divider()
-
-col_btn, col_info = st.columns([2,3])
-with col_btn:
-    load_btn = st.button("Load Today's Slate")
-with col_info:
-    st.markdown("""
-    **Auto-loads:** MLB schedule · probable pitchers · **all 500+ batters** (MLB Stats API) · Fangraphs advanced stats (if available) · confirmed lineups · live ballpark weather
-    """)
-
-if load_btn:
-    with st.status("Loading today's slate...", expanded=True) as status:
-        st.write("Fetching MLB schedule and probable pitchers...")
-        sched = fetch_schedule(str(sel_date))
-        if sched.empty:
-            st.error("No games found for " + str(sel_date)); st.stop()
-        st.write(f"Found {len(sched)} games")
-
-        st.write("Loading all MLB batting stats (MLB Stats API — covers every player)...")
-        mlb_all = fetch_all_mlb_batting_stats(sel_date.year)
-        st.write(f"MLB batting stats: {len(mlb_all)} players")
-
-        st.write("Trying Fangraphs advanced stats (wRC+, Hard Hit%, Barrel%)...")
-        fg_df = fetch_fangraphs_stats(sel_date.year)
-        if fg_df.empty:
-            st.write("Fangraphs unavailable — using MLB API stats with derived metrics")
-        else:
-            st.write(f"Fangraphs loaded: {len(fg_df)} batters")
-
-        all_rows = []
-        for _, g in sched.iterrows():
-            st.write(f"Processing {g['away_team']} @ {g['home_team']}...")
-            wx       = fetch_weather(g["venue"])
-            lineups  = fetch_live_lineups(int(g["gamePk"]))
-            away_conf = not lineups.get("away",pd.DataFrame()).empty
-            home_conf = not lineups.get("home",pd.DataFrame()).empty
-
-            away_roster = fetch_active_roster(int(g["away_team_id"]))
-            home_roster = fetch_active_roster(int(g["home_team_id"]))
-            away_batters = away_roster[away_roster["pos_type"] != "Pitcher"]
-            home_batters = home_roster[home_roster["pos_type"] != "Pitcher"]
-
-            away_ids = lineups["away"]["player_id"].tolist() if away_conf else away_batters["player_id"].tolist()
-            home_ids = lineups["home"]["player_id"].tolist() if home_conf else home_batters["player_id"].tolist()
-            
-            away_stats_map = {row["player_id"]: row for _, row in lineups["away"].iterrows()} if away_conf else {}
-            home_stats_map = {row["player_id"]: row for _, row in lineups["home"].iterrows()} if home_conf else {}
-
-            away_pitch = fetch_pitcher_stats(g["away_prob_id"])
-            home_pitch = fetch_pitcher_stats(g["home_prob_id"])
-            away_pitch["name"] = g["away_prob_name"]
-            home_pitch["name"] = g["home_prob_name"]
-
-            total_env = wx["factor"] * wx_modifier(wx["temp"], wx["wind"], wx["dome"])
-            if total_env >= 1.06:
-                env_symbol = "🟢 Hitter-Friendly"
-            elif total_env >= 0.97:
-                env_symbol = "🟡 Neutral"
-            else:
-                env_symbol = "🔴 Pitcher-Friendly"
-
-            game_status_label = g["status"]
-
-            for side_label, player_ids, stats_map, opp_pitch, conf in [
-                ("Away", away_ids, away_stats_map, home_pitch, away_conf),
-                ("Home", home_ids, home_stats_map, away_pitch, home_conf),
-            ]:
-                p_era = opp_pitch.get("era", 4.5)
-                p_whip = opp_pitch.get("whip", 1.35)
-                
-                if p_era >= 4.5 or p_whip >= 1.35:
-                    p_rating = "🟢 Target"
-                elif p_era <= 3.4 and p_whip <= 1.20:
-                    p_rating = "🔴 Avoid"
-                else:
-                    p_rating = "🟡 Neutral"
-
-                for pid in player_ids:
-                    pid = int(pid)
-                    player_live_data = stats_map.get(pid, {})
-                    order = int(player_live_data.get("order", 9) or 9)
-                    if order > max_ord: continue
-
-                    mlb_row = mlb_all[mlb_all["player_id"] == pid] if not mlb_all.empty else pd.DataFrame()
-                    if mlb_row.empty: continue  
-                    base = mlb_row.iloc[0].to_dict()
-                    pname = base.get("name","")
-
-                    if base.get("plateAppearances",0) < min_pa: continue
-                    if float(base.get("avg",0)) < min_avg: continue
-                    
-                    # NEW: Implement the OBP slider logic
-                    if float(base.get("obp",0)) < min_obp: continue
-                    
-                    if opp_pitch.get("era",4.5) > max_era: continue
-
-                    use_adv = False
-                    wrc_plus = int(max(1, float(base.get("ops",0.700) or 0.700) * 152))
-                    hard_hit = min(0.65, 0.28 + float(base.get("iso",0)) * 1.2)
-                    barrel   = min(0.20, float(base.get("iso",0)) * 0.35)
-                    if not fg_df.empty and "name" in fg_df.columns:
-                        fg_match = fg_df[fg_df["name"].str.lower() == pname.lower()]
-                        if fg_match.empty:
-                            last = pname.split()[-1].lower() if pname else ""
-                            fg_match = fg_df[fg_df["name"].str.lower().str.endswith(last, na=False)]
-                        if not fg_match.empty:
-                            fg = fg_match.iloc[0]
-                            wrc_plus = int(fg.get("wrc_plus",wrc_plus) or wrc_plus)
-                            hard_hit = float(fg.get("hard_hit_pct",hard_hit) or hard_hit)
-                            barrel   = float(fg.get("barrel_pct",barrel) or barrel)
-                            use_adv  = True
-
-                    avg_v  = float(base.get("avg",0))
-                    obp_v  = float(base.get("obp",0))
-                    slg_v  = float(base.get("slg",0))
-                    iso_v  = float(base.get("iso",0))
-                    ops_v  = float(base.get("ops",0))
-                    k_pct  = float(base.get("k_pct",0.22))
-
-                    scores = score_batter(
-                        avg_v, obp_v, slg_v, iso_v, ops_v, k_pct, hard_hit, barrel, wrc_plus,
-                        order, opp_pitch["era"], opp_pitch["whip"], opp_pitch["homeRunsPer9"],
-                        opp_pitch.get("strikeoutsPer9Inn",8.5), wx["factor"], wx["temp"], wx["wind"],
-                        wx["dome"], use_adv, w_era, w_whip
-                    )
-                    flt = {k:v for k,v in scores.items() if k in allowed_markets}
-                    if not flt: continue
-                    best_market = max(flt, key=flt.get)
-                    best_score  = flt[best_market]
-                    
-                    if best_score >= 70.0:
-                        grade_badge = "🟢 Premium"
-                    elif best_score >= 48.0:
-                        grade_badge = "🟡 Playable"
-                    else:
-                        grade_badge = "🔴 Sub-optimal"
-
-                    if best_market == "Home Run":
-                        rationale = f"Elite power (ISO {iso_v:.3f}) matching up against a pitcher allowing {opp_pitch.get('homeRunsPer9', 1.2):.1f} HR/9."
-                    elif best_market == "RBI":
-                        rationale = f"Strong run-producer (wRC+ {wrc_plus}) hitting #{order} in the order with men likely on base."
-                    elif best_market == "Runs Scored":
-                        rationale = f"High on-base threat (OBP {obp_v:.3f}) batting #{order} facing a high-WHIP ({p_whip:.2f}) pitcher."
-                    else:
-                        rationale = f"Excellent contact profile (AVG {avg_v:.3f}) in a favourable offensive environment."
-
-                    live_hits = player_live_data.get("live_hits", 0)
-                    live_runs = player_live_data.get("live_runs", 0)
-                    live_rbi = player_live_data.get("live_rbi", 0)
-                    live_hr = player_live_data.get("live_hr", 0)
-                    
-                    is_final = game_status_label in ["Final", "Completed", "Game Over"]
-                    bet_won = False
-                    
-                    if best_market == "Home Run" and live_hr >= 1: bet_won = True
-                    elif best_market == "RBI" and live_rbi >= 1: bet_won = True
-                    elif best_market == "Runs Scored" and live_runs >= 1: bet_won = True
-                    elif best_market == "Hits/Runs" and (live_hits + live_runs) >= 2: bet_won = True
-                    
-                    if bet_won:
-                        result_status = "✅ Won"
-                    elif not bet_won and is_final:
-                        result_status = "❌ Lost"
-                    else:
-                        result_status = "⏳ Pending"
-
-                    all_rows.append({
-                        "Game":          g["away_team"] + " @ " + g["home_team"],
-                        "Game Status":   game_status_label,
-                        "Game Datetime": g["game_date_raw"],
-                        "Game Time BST": g["game_time_bst"],
-                        "Side":          side_label,
-                        "Batter":        pname,
-                        "Order":         order,
-                        "PA":            base.get("plateAppearances",0),
-                        "AVG":           round(avg_v,3),
-                        "OBP":           round(obp_v,3),
-                        "ISO":           round(iso_v,3),
-                        "wRC+":          wrc_plus,
-                        "Stats Source":  "Fangraphs" if use_adv else "MLB API",
-                        "Opp Pitcher":   opp_pitch.get("name","TBD"),
-                        "Pitcher Rating": p_rating,
-                        "Pitcher ERA":   opp_pitch.get("era",4.5),
-                        "Pitcher WHIP":  opp_pitch.get("whip",1.35),
-                        "Venue":         wx["venue"],
-                        "Park Factor":   wx["factor"],
-                        "Env Rating":    env_symbol,
-                        "Temp":          wx["temp"],
-                        "Wind":          wx["wind"],
-                        "Dome":          wx["dome"],
-                        **scores,
-                        "Best Market":   best_market,
-                        "Best Score":    best_score,
-                        "Grade":         grade_badge,
-                        "Rationale":     rationale,
-                        "Lineup Status": "Confirmed" if conf else "Projected",
-                        "Live Hits":     live_hits,
-                        "Live Runs":     live_runs,
-                        "Live RBI":      live_rbi,
-                        "Live HR":       live_hr,
-                        "Slip Result":   result_status
-                    })
-
-        if not all_rows:
-            st.error("No batters matched filters."); status.update(label="No results", state="error")
-        else:
-            df = pd.DataFrame(all_rows).sort_values("Best Score", ascending=False)
-            st.session_state["auto_df"] = df
-            status.update(label=f"Done — {len(df)} batters scored across {len(sched)} games", state="complete")
-
-if "auto_df" in st.session_state:
-    df = st.session_state["auto_df"]
-    if df.empty:
-        st.info("No results. Adjust filters and reload.")
-    else:
-        top = df.iloc[0]
-        fg_c  = len(df[df["Stats Source"]=="Fangraphs"])
-        mlb_c = len(df[df["Stats Source"]=="MLB API"])
-        conf_c= len(df[df["Lineup Status"]=="Confirmed"])
-
-        k1,k2,k3,k4 = st.columns(4)
-        for col,val,lbl in [(k1,str(len(df)),"Batters Scored"),(k2,top["Batter"],"Top Batter"),
-                            (k3,top["Best Market"],"Best Market"),(k4,f"{top['Best Score']:.2f}","Top Score")]:
-            with col:
-                st.markdown(f'<div class="metric-card"><div class="metric-value">{val}</div>'
-                            f'<div class="metric-label">{lbl}</div></div>', unsafe_allow_html=True)
-
-        st.info(f"Fangraphs: {fg_c} batters  |  MLB API: {mlb_c} batters  |  Confirmed lineups: {conf_c} batters")
-
-        SHOW = ["Game","Game Time BST","Batter","Order","AVG","OBP","ISO","wRC+","Env Rating", "Pitcher Rating", "Grade"]
-
-        all_t, game_t, tracker_t, t_hits, t_rbi, t_hr, t_runs, t_raw = st.tabs([
-            "All Ranked", "🗂️ Game by Game", "✅ Slip Tracker", "Hits/Runs", "RBI", "Home Run", "Runs Scored", "Raw Data"
-        ])
-
-        with all_t:
-            st.markdown("### 📋 Ranked Prop Targets")
-            f_col1, f_col2, f_col3 = st.columns(3)
-            with f_col1:
-                sel_markets = st.multiselect("🎯 Filter by Market", options=df["Best Market"].unique(), default=df["Best Market"].unique())
-            with f_col2:
-                sel_grades = st.multiselect("📊 Filter by Grade", options=df["Grade"].unique(), default=df["Grade"].unique())
-            with f_col3:
-                sel_status = st.multiselect("⏳ Lineup Status", options=df["Lineup Status"].unique(), default=df["Lineup Status"].unique())
-            
-            filtered_df = df[
-                (df["Best Market"].isin(sel_markets)) & 
-                (df["Grade"].isin(sel_grades)) &
-                (df["Lineup Status"].isin(sel_status))
-            ]
-            
-            max_score = float(filtered_df["Best Score"].max()) if not filtered_df.empty else 100.0
-            
-            disp = [c for c in SHOW + ["Best Market", "Best Score", "Lineup Status"] if c in filtered_df.columns]
-            st.dataframe(filtered_df[disp].reset_index(drop=True), use_container_width=True, hide_index=True,
-                column_config={
-                    "Best Score": st.column_config.ProgressColumn("Best Score", min_value=0, max_value=max_score, format="%.1f", color="#a12c7b"),
-                    "AVG": st.column_config.NumberColumn("BA", format="%.3f"),
-                    "OBP": st.column_config.NumberColumn(format="%.3f"),
-                    "ISO": st.column_config.NumberColumn(format="%.3f"),
-                })
-
-        with game_t:
-            st.subheader("🗂️ Matchup Breakdown")
-            st.caption("Expand a matchup below to view structural player rankings, confirmed lineups, and pitching variables for that specific game.")
-            
-            sorted_games = df[["Game", "Game Datetime"]].drop_duplicates().sort_values("Game Datetime")
-            unique_chrono_games = sorted_games["Game"].tolist()
-            
-            for game_matchup in unique_chrono_games:
-                game_df = df[df["Game"] == game_matchup].sort_values("Order", ascending=True)
-                sample_row = game_df.iloc[0]
-                venue = sample_row["Venue"]
-                temp = int(sample_row["Temp"])
-                wind = int(sample_row["Wind"])
-                is_dome = sample_row["Dome"]
-                bst_time = sample_row["Game Time BST"]
-                env_badge = sample_row["Env Rating"]
-                
-                weather_str = "🏟️ Dome" if is_dome else f"🌡️ {temp}°F | 💨 {wind} mph"
-                lineup_badge = "✅ Confirmed" if sample_row["Lineup Status"] == "Confirmed" else "⏳ Projected"
-                
-                with st.expander(f"⚾ {game_matchup}  🕒 {bst_time}  |  {venue} ({weather_str})  |  Conditions: {env_badge}  |  Lineups: {lineup_badge}"):
-                    col_away, col_home = st.columns(2)
-                    
-                    with col_away:
-                        away_team_name = game_matchup.split(" @ ")[0]
-                        away_df = game_df[game_df["Side"] == "Away"]
-                        away_pitcher = away_df["Opp Pitcher"].iloc[0] if not away_df.empty else "TBD"
-                        away_p_rating = away_df["Pitcher Rating"].iloc[0] if not away_df.empty else ""
-                        st.markdown(f"### 🚀 {away_team_name}")
-                        st.caption(f"Facing Pitcher: **{away_pitcher}** ({away_p_rating})")
-                        
-                        if not away_df.empty:
-                            st.dataframe(
-                                away_df[["Order", "Batter", "wRC+", "OBP", "ISO", "Grade", "Best Market", "Best Score"]].reset_index(drop=True),
-                                use_container_width=True, hide_index=True,
-                                column_config={
-                                    "Best Score": st.column_config.NumberColumn("Score", format="%.1f"),
-                                    "OBP": st.column_config.NumberColumn(format="%.3f"),
-                                    "ISO": st.column_config.NumberColumn(format="%.3f"),
-                                }
-                            )
-                        else:
-                            st.info("No batter data met filter criteria for this side.")
-                        
-                    with col_home:
-                        home_team_name = game_matchup.split(" @ ")[1]
-                        home_df = game_df[game_df["Side"] == "Home"]
-                        home_pitcher = home_df["Opp Pitcher"].iloc[0] if not home_df.empty else "TBD"
-                        home_p_rating = home_df["Pitcher Rating"].iloc[0] if not home_df.empty else ""
-                        st.markdown(f"### 🏠 {home_team_name}")
-                        st.caption(f"Facing Pitcher: **{home_pitcher}** ({home_p_rating})")
-                        
-                        if not home_df.empty:
-                            st.dataframe(
-                                home_df[["Order", "Batter", "wRC+", "OBP", "ISO", "Grade", "Best Market", "Best Score"]].reset_index(drop=True),
-                                use_container_width=True, hide_index=True,
-                                column_config={
-                                    "Best Score": st.column_config.NumberColumn("Score", format="%.1f"),
-                                    "OBP": st.column_config.NumberColumn(format="%.3f"),
-                                    "ISO": st.column_config.NumberColumn(format="%.3f"),
-                                }
-                            )
-                        else:
-                            st.info("No batter data met filter criteria for this side.")
-
-        with tracker_t:
-            st.subheader("✅ Live Slip Tracker")
-            st.caption("Tracks your top recommended bets in real-time. Hit the 'Load Today's Slate' button to fetch the latest pitch-by-pitch updates.")
-            
-            tracker_df = df[df["Grade"].isin(["🟢 Premium", "🟡 Playable"])].copy()
-            
-            if tracker_df.empty:
-                st.info("No Playable or Premium bets available to track right now.")
-            else:
-                tracker_df["Target"] = tracker_df["Best Market"].apply(lambda x: "2+ (Hits+Runs)" if x == "Hits/Runs" else "1+ " + x)
-                tracker_df["Live Stats"] = "H:" + tracker_df["Live Hits"].astype(str) + " R:" + tracker_df["Live Runs"].astype(str) + " RBI:" + tracker_df["Live RBI"].astype(str) + " HR:" + tracker_df["Live HR"].astype(str)
-                
-                display_cols = ["Game Time BST", "Batter", "Game Status", "Best Market", "Target", "Live Stats", "Slip Result"]
-                
-                st.dataframe(
-                    tracker_df[display_cols].reset_index(drop=True), 
-                    use_container_width=True, 
-                    hide_index=True
-                )
-
-        for tab, market in [(t_hits,"Hits/Runs"),(t_rbi,"RBI"),(t_hr,"Home Run"),(t_runs,"Runs Scored")]:
-            with tab:
-                sub = df[df["Best Market"]==market]
-                if sub.empty:
-                    st.info("No picks available for " + market); continue
-                c_chart, c_cards = st.columns([3,2])
-                with c_chart:
-                    fig = go.Figure(go.Bar(
-                        y=sub.head(12)["Batter"]+" | "+sub.head(12)["Game"],
-                        x=sub.head(12)["Best Score"], orientation="h",
-                        marker_color=MARKET_COLORS[market],
-                        text=["ERA "+str(e) for e in sub.head(12)["Pitcher ERA"]],
-                        textposition="inside", insidetextanchor="start",
-                        textfont=dict(color="white",size=11),
-                    ))
-                    fig.update_layout(title="Top "+market+" Picks",
-                        yaxis=dict(autorange="reversed"), height=460,
-                        plot_bgcolor="#f9f8f5", paper_bgcolor="#f7f6f2",
-                        margin=dict(l=10,r=10,t=40,b=20), font=dict(family="Inter"))
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                with c_cards:
-                    st.markdown("### 🎯 Best Value Slips")
-                    for _, row in sub.head(6).iterrows():
-                        with st.container(border=True):
-                            card_left, card_right = st.columns([3, 1])
-                            with card_left:
-                                st.markdown(f"**{row['Batter']}**")
-                                st.caption(f"Slot: #{int(row['Order'])} | {row['Game']} 🕒 {row['Game Time BST']}")
-                            with card_right:
-                                st.metric(label="Score", value=f"{row['Best Score']:.1f}")
-                                st.markdown(f"**{row['Grade']}**")
-                            
-                            st.markdown(f"🔬 `wRC+: {row['wRC+']}` | `OBP: {row['OBP']:.3f}` | `ISO: {row['ISO']:.3f}`")
-                            st.markdown(f"🔥 `vs: {row['Opp Pitcher']} (ERA {row['Pitcher ERA']})` | {row['Pitcher Rating']}")
-                            st.markdown(f"🏟️ `{row['Venue']}` | Conditions: `{row['Env Rating']}`")
-                            st.divider()
-                            st.caption(f"💡 **Why back him:** {row['Rationale']}")
-
-        with t_raw:
-            st.dataframe(df.reset_index(drop=True), use_container_width=True, hide_index=True)
-
-        st.download_button("Download Full CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name=f"mlb_props_{sel_date}.csv", mime="text/csv")
-
-st.divider()
-st.caption("MLB Stats API (all batters via playerPool=ALL) · Fangraphs via pybaseball (optional enrichment) · Open-Meteo weather")
+    # Runs Scor
