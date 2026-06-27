@@ -309,7 +309,8 @@ def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
 # ── SIDEBAR ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚾ MLB Props v2.1")
-    odds_key = st.text_input("The-Odds-API Key (Optional)", type="password", help="Input key to overlay live UK bookmaker odds on team markets.")
+    # HARDCODED YOUR ODDS API KEY HERE
+    odds_key = st.text_input("The-Odds-API Key", value="4b959d673d4ef9c7128271557c038dfe", type="password", help="Live UK bookmaker odds key.")
     sel_date = st.date_input("Slate Date", value=date.today())
     st.markdown("---")
     st.markdown("### Filters")
