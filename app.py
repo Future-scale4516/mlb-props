@@ -4,8 +4,9 @@ import plotly.graph_objects as go
 import requests as req
 from datetime import date, datetime, timedelta
 import time
+from fractions import Fraction
 
-st.set_page_config(page_title="MLB Prop Analyser v2", page_icon="⚾", layout="wide")
+st.set_page_config(page_title="MLB Prop Analyser v2.1", page_icon="⚾", layout="wide")
 
 st.markdown("""
 <style>
@@ -18,6 +19,9 @@ html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .metric-label{font-size:.72rem;color:#7a7974;text-transform:uppercase;letter-spacing:.05em;margin-top:3px;}
 section[data-testid="stSidebar"]{background:#1c1b19;}
 section[data-testid="stSidebar"] *{color:#cdccca !important;}
+.odds-box {background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px; padding:12px; margin-top:8px; margin-bottom: 12px;}
+.pick-text {color: #166534; font-weight: 800; font-size: 1.15rem;}
+.ev-text {color: #15803d; font-weight: 700; background: #dcfce7; padding: 2px 6px; border-radius: 4px;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -63,6 +67,35 @@ def safe_get(url, params=None):
         except Exception as e:
             if attempt == 2:
                 return {}
+            time.sleep(1)
+    return {}
+
+def decimal_to_fractional(dec):
+    if not dec or dec <= 1.0: return "N/A"
+    if dec == 2.0: return "EVENS"
+    frac = Fraction(dec - 1.0).limit_denominator(20)
+    return f"{frac.numerator}/{frac.denominator}"
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_live_odds_api(api_key: str):
+    if not api_key or api_key.strip() == "": return {}
+    url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
+    params = {
+        "apiKey": api_key, "regions": "uk", "markets": "h2h,spreads,totals",
+        "bookmakers": "williamhill,paddypower,betfair,bet365,skybet", "oddsFormat": "decimal"
+    }
+    for attempt in range(3):
+        try:
+            r = req.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            res = r.json()
+            out = {}
+            if isinstance(res, list):
+                for item in res:
+                    out[f"{item.get('away_team')} @ {item.get('home_team')}"] = item.get("bookmakers", [])
+            return out
+        except:
+            if attempt == 2: return {}
             time.sleep(1)
     return {}
 
@@ -275,12 +308,12 @@ def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
 
 # ── SIDEBAR ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚾ MLB Props v2")
+    st.markdown("## ⚾ MLB Props v2.1")
+    odds_key = st.text_input("The-Odds-API Key (Optional)", type="password", help="Input key to overlay live UK bookmaker odds on team markets.")
     sel_date = st.date_input("Slate Date", value=date.today())
     st.markdown("---")
     st.markdown("### Filters")
     min_avg  = st.slider("Min AVG",   0.100, 0.350, 0.180, 0.005, format="%.3f")
-    # NEW: OBP Slider
     min_obp  = st.slider("Min OBP",   0.250, 0.400, 0.280, 0.005, format="%.3f")
     min_pa   = st.slider("Min PA",    0, 200, 30, 10)
     max_era  = st.slider("Max opp ERA", 1.5, 10.0, 10.0, 0.1)
@@ -298,7 +331,6 @@ with st.sidebar:
     st.markdown("### 📊 Score Key")
     st.markdown("🟢 **70+** : Premium Value\n🟡 **48-69** : Playable\n🔴 **<48** : Sub-optimal")
     
-    # NEW: Expandable Stat Cheat Sheet
     st.markdown("---")
     st.markdown("### 📖 Stat Cheat Sheet")
     with st.expander("View Elite Thresholds"):
@@ -327,15 +359,15 @@ with st.sidebar:
     st.markdown("---")
     if st.button("Clear Cache"):
         st.cache_data.clear()
-        for k in ["auto_df"]:
+        for k in ["auto_df", "game_proj_dict", "odds_data"]:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
 allowed_markets = [m for m,s in [
     ("Hits/Runs",s_hits),("RBI",s_rbi),("Home Run",s_hr),("Runs Scored",s_runs)] if s]
 
-st.title("⚾ MLB Prop Analyser v2")
-st.caption("Auto-fetches every MLB batter, probable pitchers, confirmed lineups and live weather.")
+st.title("⚾ MLB Prop & Game Analyser v2.1")
+st.caption("Auto-fetches every MLB batter, probable pitchers, confirmed lineups, live weather, and game projections.")
 st.divider()
 
 col_btn, col_info = st.columns([2,3])
@@ -343,7 +375,7 @@ with col_btn:
     load_btn = st.button("Load Today's Slate")
 with col_info:
     st.markdown("""
-    **Auto-loads:** MLB schedule · probable pitchers · **all 500+ batters** (MLB Stats API) · Fangraphs advanced stats (if available) · confirmed lineups · live ballpark weather
+    **Auto-loads:** MLB schedule · probable pitchers · **all 500+ batters** (MLB Stats API) · Fangraphs advanced stats (if available) · confirmed lineups · live ballpark weather · **game projections**
     """)
 
 if load_btn:
@@ -365,9 +397,14 @@ if load_btn:
         else:
             st.write(f"Fangraphs loaded: {len(fg_df)} batters")
 
+        st.session_state["odds_data"] = fetch_live_odds_api(odds_key) if odds_key else {}
+
         all_rows = []
+        game_projections = {}
+
         for _, g in sched.iterrows():
-            st.write(f"Processing {g['away_team']} @ {g['home_team']}...")
+            g_matchup = f"{g['away_team']} @ {g['home_team']}"
+            st.write(f"Processing {g_matchup}...")
             wx       = fetch_weather(g["venue"])
             lineups  = fetch_live_lineups(int(g["gamePk"]))
             away_conf = not lineups.get("away",pd.DataFrame()).empty
@@ -390,14 +427,14 @@ if load_btn:
             home_pitch["name"] = g["home_prob_name"]
 
             total_env = wx["factor"] * wx_modifier(wx["temp"], wx["wind"], wx["dome"])
-            if total_env >= 1.06:
-                env_symbol = "🟢 Hitter-Friendly"
-            elif total_env >= 0.97:
-                env_symbol = "🟡 Neutral"
-            else:
-                env_symbol = "🔴 Pitcher-Friendly"
+            if total_env >= 1.06: env_symbol = "🟢 Hitter-Friendly"
+            elif total_env >= 0.97: env_symbol = "🟡 Neutral"
+            else: env_symbol = "🔴 Pitcher-Friendly"
 
             game_status_label = g["status"]
+
+            away_wrcs = []
+            home_wrcs = []
 
             for side_label, player_ids, stats_map, opp_pitch, conf in [
                 ("Away", away_ids, away_stats_map, home_pitch, away_conf),
@@ -406,36 +443,25 @@ if load_btn:
                 p_era = opp_pitch.get("era", 4.5)
                 p_whip = opp_pitch.get("whip", 1.35)
                 
-                if p_era >= 4.5 or p_whip >= 1.35:
-                    p_rating = "🟢 Target"
-                elif p_era <= 3.4 and p_whip <= 1.20:
-                    p_rating = "🔴 Avoid"
-                else:
-                    p_rating = "🟡 Neutral"
+                if p_era >= 4.5 or p_whip >= 1.35: p_rating = "🟢 Target"
+                elif p_era <= 3.4 and p_whip <= 1.20: p_rating = "🔴 Avoid"
+                else: p_rating = "🟡 Neutral"
 
                 for pid in player_ids:
                     pid = int(pid)
                     player_live_data = stats_map.get(pid, {})
                     order = int(player_live_data.get("order", 9) or 9)
-                    if order > max_ord: continue
-
+                    
                     mlb_row = mlb_all[mlb_all["player_id"] == pid] if not mlb_all.empty else pd.DataFrame()
                     if mlb_row.empty: continue  
                     base = mlb_row.iloc[0].to_dict()
                     pname = base.get("name","")
 
-                    if base.get("plateAppearances",0) < min_pa: continue
-                    if float(base.get("avg",0)) < min_avg: continue
-                    
-                    # NEW: Implement the OBP slider logic
-                    if float(base.get("obp",0)) < min_obp: continue
-                    
-                    if opp_pitch.get("era",4.5) > max_era: continue
-
                     use_adv = False
                     wrc_plus = int(max(1, float(base.get("ops",0.700) or 0.700) * 152))
                     hard_hit = min(0.65, 0.28 + float(base.get("iso",0)) * 1.2)
                     barrel   = min(0.20, float(base.get("iso",0)) * 0.35)
+                    
                     if not fg_df.empty and "name" in fg_df.columns:
                         fg_match = fg_df[fg_df["name"].str.lower() == pname.lower()]
                         if fg_match.empty:
@@ -447,6 +473,15 @@ if load_btn:
                             hard_hit = float(fg.get("hard_hit_pct",hard_hit) or hard_hit)
                             barrel   = float(fg.get("barrel_pct",barrel) or barrel)
                             use_adv  = True
+
+                    if side_label == "Away" and order <= 9: away_wrcs.append(wrc_plus)
+                    if side_label == "Home" and order <= 9: home_wrcs.append(wrc_plus)
+
+                    if order > max_ord: continue
+                    if base.get("plateAppearances",0) < min_pa: continue
+                    if float(base.get("avg",0)) < min_avg: continue
+                    if float(base.get("obp",0)) < min_obp: continue
+                    if opp_pitch.get("era",4.5) > max_era: continue
 
                     avg_v  = float(base.get("avg",0))
                     obp_v  = float(base.get("obp",0))
@@ -466,21 +501,14 @@ if load_btn:
                     best_market = max(flt, key=flt.get)
                     best_score  = flt[best_market]
                     
-                    if best_score >= 70.0:
-                        grade_badge = "🟢 Premium"
-                    elif best_score >= 48.0:
-                        grade_badge = "🟡 Playable"
-                    else:
-                        grade_badge = "🔴 Sub-optimal"
+                    if best_score >= 70.0: grade_badge = "🟢 Premium"
+                    elif best_score >= 48.0: grade_badge = "🟡 Playable"
+                    else: grade_badge = "🔴 Sub-optimal"
 
-                    if best_market == "Home Run":
-                        rationale = f"Elite power (ISO {iso_v:.3f}) matching up against a pitcher allowing {opp_pitch.get('homeRunsPer9', 1.2):.1f} HR/9."
-                    elif best_market == "RBI":
-                        rationale = f"Strong run-producer (wRC+ {wrc_plus}) hitting #{order} in the order with men likely on base."
-                    elif best_market == "Runs Scored":
-                        rationale = f"High on-base threat (OBP {obp_v:.3f}) batting #{order} facing a high-WHIP ({p_whip:.2f}) pitcher."
-                    else:
-                        rationale = f"Excellent contact profile (AVG {avg_v:.3f}) in a favourable offensive environment."
+                    if best_market == "Home Run": rationale = f"Elite power (ISO {iso_v:.3f}) matching up against a pitcher allowing {opp_pitch.get('homeRunsPer9', 1.2):.1f} HR/9."
+                    elif best_market == "RBI": rationale = f"Strong run-producer (wRC+ {wrc_plus}) hitting #{order} in the order with men likely on base."
+                    elif best_market == "Runs Scored": rationale = f"High on-base threat (OBP {obp_v:.3f}) batting #{order} facing a high-WHIP ({p_whip:.2f}) pitcher."
+                    else: rationale = f"Excellent contact profile (AVG {avg_v:.3f}) in a favourable offensive environment."
 
                     live_hits = player_live_data.get("live_hits", 0)
                     live_runs = player_live_data.get("live_runs", 0)
@@ -495,15 +523,12 @@ if load_btn:
                     elif best_market == "Runs Scored" and live_runs >= 1: bet_won = True
                     elif best_market == "Hits/Runs" and (live_hits + live_runs) >= 2: bet_won = True
                     
-                    if bet_won:
-                        result_status = "✅ Won"
-                    elif not bet_won and is_final:
-                        result_status = "❌ Lost"
-                    else:
-                        result_status = "⏳ Pending"
+                    if bet_won: result_status = "✅ Won"
+                    elif not bet_won and is_final: result_status = "❌ Lost"
+                    else: result_status = "⏳ Pending"
 
                     all_rows.append({
-                        "Game":          g["away_team"] + " @ " + g["home_team"],
+                        "Game":          g_matchup,
                         "Game Status":   game_status_label,
                         "Game Datetime": g["game_date_raw"],
                         "Game Time BST": g["game_time_bst"],
@@ -539,15 +564,33 @@ if load_btn:
                         "Slip Result":   result_status
                     })
 
+            # Calculate Team Projections
+            mean_away_wrc = sum(away_wrcs)/len(away_wrcs) if away_wrcs else 100
+            mean_home_wrc = sum(home_wrcs)/len(home_wrcs) if home_wrcs else 100
+            proj_away_runs = round(4.1 * (mean_away_wrc/100) * (home_pitch.get("era", 4.3)/4.3) * wx["factor"], 2)
+            proj_home_runs = round(4.1 * (mean_home_wrc/100) * (away_pitch.get("era", 4.3)/4.3) * wx["factor"], 2)
+            away_prob = round((proj_away_runs**1.83) / ((proj_away_runs**1.83) + (proj_home_runs**1.83)), 4) if (proj_away_runs + proj_home_runs) > 0 else 0.5
+            
+            game_projections[g_matchup] = {
+                "proj_away_runs": proj_away_runs, "proj_home_runs": proj_home_runs,
+                "away_prob": away_prob, "home_prob": 1.0 - away_prob, 
+                "proj_total": round(proj_away_runs + proj_home_runs, 1),
+                "proj_line": round(proj_home_runs - proj_away_runs, 1)
+            }
+
         if not all_rows:
             st.error("No batters matched filters."); status.update(label="No results", state="error")
         else:
             df = pd.DataFrame(all_rows).sort_values("Best Score", ascending=False)
             st.session_state["auto_df"] = df
+            st.session_state["game_proj_dict"] = game_projections
             status.update(label=f"Done — {len(df)} batters scored across {len(sched)} games", state="complete")
 
 if "auto_df" in st.session_state:
     df = st.session_state["auto_df"]
+    game_proj_dict = st.session_state.get("game_proj_dict", {})
+    odds_data = st.session_state.get("odds_data", {})
+    
     if df.empty:
         st.info("No results. Adjust filters and reload.")
     else:
@@ -567,8 +610,8 @@ if "auto_df" in st.session_state:
 
         SHOW = ["Game","Game Time BST","Batter","Order","AVG","OBP","ISO","wRC+","Env Rating", "Pitcher Rating", "Grade"]
 
-        all_t, game_t, tracker_t, t_hits, t_rbi, t_hr, t_runs, t_raw = st.tabs([
-            "All Ranked", "🗂️ Game by Game", "✅ Slip Tracker", "Hits/Runs", "RBI", "Home Run", "Runs Scored", "Raw Data"
+        all_t, game_t, tracker_t, t_hits, t_rbi, t_hr, t_runs, t_ml, t_rl, t_tot, t_raw = st.tabs([
+            "All Ranked", "🗂️ Game by Game", "✅ Slip Tracker", "Hits/Runs", "RBI", "Home Run", "Runs Scored", "💰 Moneyline", "📈 Run Line", "📊 Totals", "Raw Data"
         ])
 
         with all_t:
@@ -721,6 +764,116 @@ if "auto_df" in st.session_state:
                             st.markdown(f"🏟️ `{row['Venue']}` | Conditions: `{row['Env Rating']}`")
                             st.divider()
                             st.caption(f"💡 **Why back him:** {row['Rationale']}")
+
+        # ── MONEYLINE OVERLAY ──
+        with t_ml:
+            st.subheader("💰 Live Moneyline Value")
+            sorted_games = df[["Game", "Game Datetime"]].drop_duplicates().sort_values("Game Datetime")["Game"].tolist()
+            if not odds_data: st.info("No Odds API key detected. Model probabilities are displayed without bookmaker comparisons.")
+            
+            for game_matchup in sorted_games:
+                proj = game_proj_dict.get(game_matchup)
+                if not proj: continue
+                away_team, home_team = game_matchup.split(" @ ")
+                match_odds_list = odds_data.get(game_matchup, [])
+                
+                best_away_ev, best_home_ev = -100, -100
+                best_away_bookie, best_home_bookie, away_price, home_price = "", "", "", ""
+                
+                if match_odds_list:
+                    for b in match_odds_list:
+                        h2h = next((m for m in b.get("markets", []) if m["key"] == "h2h"), None)
+                        if h2h:
+                            out = h2h.get("outcomes", [])
+                            a_o = next((o for o in out if o["name"] == away_team), None)
+                            h_o = next((o for o in out if o["name"] == home_team), None)
+                            if a_o and h_o:
+                                a_ev = ((proj["away_prob"] * a_o["price"]) - 1.0) * 100
+                                h_ev = ((proj["home_prob"] * h_o["price"]) - 1.0) * 100
+                                if a_ev > best_away_ev:
+                                    best_away_ev, best_away_bookie, away_price = a_ev, b["title"], decimal_to_fractional(a_o["price"])
+                                if h_ev > best_home_ev:
+                                    best_home_ev, best_home_bookie, home_price = h_ev, b["title"], decimal_to_fractional(h_o["price"])
+                
+                with st.container(border=True):
+                    st.markdown(f"**{game_matchup}** | Model Probabilities: {away_team} ({proj['away_prob']*100:.1f}%) vs {home_team} ({proj['home_prob']*100:.1f}%)")
+                    if not match_odds_list:
+                        pass # Only display probabilities if no odds are fetched
+                    elif best_away_ev > 0:
+                        st.markdown(f"<div class='odds-box'><span class='pick-text'>🤖 Model Recommends: Back {away_team}</span> at {away_price} (via {best_away_bookie}) | <span class='ev-text'>+{best_away_ev:.1f}% EV</span></div>", unsafe_allow_html=True)
+                    elif best_home_ev > 0:
+                        st.markdown(f"<div class='odds-box'><span class='pick-text'>🤖 Model Recommends: Back {home_team}</span> at {home_price} (via {best_home_bookie}) | <span class='ev-text'>+{best_home_ev:.1f}% EV</span></div>", unsafe_allow_html=True)
+                    else:
+                        st.write("No mathematical value edge found on current bookmaker lines.")
+
+        # ── RUN LINE OVERLAY ──
+        with t_rl:
+            st.subheader("📈 Live Run Line Value")
+            sorted_games = df[["Game", "Game Datetime"]].drop_duplicates().sort_values("Game Datetime")["Game"].tolist()
+            if not odds_data: st.info("No Odds API key detected. Model projected lines are displayed without bookmaker comparisons.")
+            
+            for game_matchup in sorted_games:
+                proj = game_proj_dict.get(game_matchup)
+                if not proj: continue
+                away_team, home_team = game_matchup.split(" @ ")
+                match_odds_list = odds_data.get(game_matchup, [])
+                
+                with st.container(border=True):
+                    st.markdown(f"**{game_matchup}** | Model Projected Gap: {proj['proj_line']} ({home_team} advantage)")
+                    found_spread = False
+                    if match_odds_list:
+                        for b in match_odds_list:
+                            spreads = next((m for m in b.get("markets", []) if m["key"] == "spreads"), None)
+                            if spreads:
+                                found_spread = True
+                                out = spreads.get("outcomes", [])
+                                a_o = next((o for o in out if o["name"] == away_team), None)
+                                if a_o:
+                                    rec_text = ""
+                                    if proj['proj_line'] < (a_o['point'] * -1): 
+                                        rec_text = f"<br><span class='pick-text'>🤖 Model Recommends: Back {away_team} {a_o['point']}</span>"
+                                    st.markdown(f"*{b['title']}:* {away_team} {a_o['point']} at {decimal_to_fractional(a_o['price'])} {rec_text}", unsafe_allow_html=True)
+                                break 
+                    if match_odds_list and not found_spread:
+                        st.write("Awaiting live run line data.")
+
+        # ── TOTALS OVERLAY ──
+        with t_tot:
+            st.subheader("📊 Live Totals (Overs/Unders)")
+            sorted_games = df[["Game", "Game Datetime"]].drop_duplicates().sort_values("Game Datetime")["Game"].tolist()
+            if not odds_data: st.info("No Odds API key detected. Model projected totals are displayed without bookmaker comparisons.")
+            
+            for game_matchup in sorted_games:
+                proj = game_proj_dict.get(game_matchup)
+                if not proj: continue
+                match_odds_list = odds_data.get(game_matchup, [])
+                
+                with st.container(border=True):
+                    st.markdown(f"**{game_matchup}** | Model Projected Total: **{proj['proj_total']} Runs**")
+                    found_total = False
+                    if match_odds_list:
+                        for b in match_odds_list:
+                            totals = next((m for m in b.get("markets", []) if m["key"] == "totals"), None)
+                            if totals:
+                                found_total = True
+                                out = totals.get("outcomes", [])
+                                o_o = next((o for o in out if o["name"].lower() == "over"), None)
+                                u_o = next((o for o in out if o["name"].lower() == "under"), None)
+                                if o_o and u_o:
+                                    bookie_line = o_o['point']
+                                    rec_text = ""
+                                    if proj['proj_total'] > (bookie_line + 0.5):
+                                        rec_text = f"<div class='odds-box'><span class='pick-text'>🤖 Model Recommends: OVER {bookie_line}</span> at {decimal_to_fractional(o_o['price'])} (via {b['title']})</div>"
+                                    elif proj['proj_total'] < (bookie_line - 0.5):
+                                        rec_text = f"<div class='odds-box'><span class='pick-text'>🤖 Model Recommends: UNDER {bookie_line}</span> at {decimal_to_fractional(u_o['price'])} (via {b['title']})</div>"
+                                    
+                                    if rec_text:
+                                        st.markdown(rec_text, unsafe_allow_html=True)
+                                    else:
+                                        st.write(f"Line set accurately at {bookie_line} by {b['title']}. No edge.")
+                                break
+                    if match_odds_list and not found_total:
+                        st.write("Awaiting live totals data.")
 
         with t_raw:
             st.dataframe(df.reset_index(drop=True), use_container_width=True, hide_index=True)
