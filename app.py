@@ -162,7 +162,6 @@ def fetch_active_roster_mlb(team_id: int):
     rows = []
     for r in data.get("roster",[]):
         if r.get("position",{}).get("type") != "Pitcher":
-            # Assigning 4 protects unconfirmed batters from math penalties
             rows.append({"name": r.get("person",{}).get("fullName"), "order": 4})
     return pd.DataFrame(rows)
 
@@ -203,10 +202,8 @@ def score_batter(b_stats, p_stats, order, env_factor):
 # ── SIDEBAR CONFIGURATION ──
 with st.sidebar:
     st.markdown("## ⚾ API Keys")
-    # ✅ PASTE YOUR TANK01 API KEY IN THE EMPTY QUOTES BELOW
-    api_key_input = st.text_input("Tank01 API Key (RapidAPI)", value="", type="password")
-    
-    # ODDS API IS ALREADY HARDCODED FOR YOU HERE
+    # BOTH KEYS ARE NOW HARDCODED HERE FOR YOU
+    api_key_input = st.text_input("Tank01 API Key (RapidAPI)", value="46e23ff209mshb208e90af2f00d4p120983jsn38b0da2800d0", type="password")
     odds_key = st.text_input("The-Odds-API Key", value="4b959d673d4ef9c7128271557c038dfe", type="password")
     sel_date = st.date_input("Slate Date", value=date.today())
     
@@ -229,10 +226,6 @@ st.caption("Decoupled Architecture: Game odds run independently of strict player
 st.divider()
 
 if st.button("Load Today's Slate", type="primary"):
-    if not api_key_input:
-        st.warning("⚠️ Please enter your Tank01 API Key in the sidebar or hardcode it in the script.")
-        st.stop()
-        
     with st.status("Fetching decoupled data streams...", expanded=True) as status:
         sched = fetch_daily_schedule_tank(str(sel_date), api_key_input)
         if sched.empty: 
@@ -255,7 +248,7 @@ if st.button("Load Today's Slate", type="primary"):
             w_data = weather_dict.get(g_id, {"factor": 1.0, "symbol": "🟡 50/50", "desc": "TBD"})
             l_data = lineups_dict.get(g_id, {"away": pd.DataFrame(), "home": pd.DataFrame()})
             
-            # EARLY MORNING ROSTER FALLBACK (Ensures batters exist before 12 PM)
+            # EARLY MORNING ROSTER FALLBACK
             if l_data["away"].empty:
                 l_data["away"] = fetch_active_roster_mlb(TEAM_IDS.get(g["away_team"]))
                 away_conf = False
@@ -292,12 +285,11 @@ if st.button("Load Today's Slate", type="primary"):
                     if side_label == "Away" and order <= 6: away_wrcs.append(base["wrc_plus"])
                     if side_label == "Home" and order <= 6: home_wrcs.append(base["wrc_plus"])
 
-                    # ── THE LOGIC TRAP FIXES ──
-                    if conf and order > max_ord: continue # Bypass Max Order filter if lineup isn't confirmed yet
+                    if conf and order > max_ord: continue 
                     if base["plateAppearances"] < min_pa: continue
                     if base["avg"] < min_avg: continue
                     if base["obp"] < min_obp: continue
-                    if opp_pitch.get("era", 4.5) < min_opp_era: continue # Flipped to Min ERA to target bad pitchers
+                    if opp_pitch.get("era", 4.5) < min_opp_era: continue 
 
                     scores, why_map = score_batter(base, opp_pitch, order, w_data["factor"])
                     best_market = max(scores, key=scores.get)
@@ -328,7 +320,6 @@ if st.button("Load Today's Slate", type="primary"):
                 "venue": g["venue"], "bst_time": g["game_time_bst"], "lineup_badge": lineup_badge
             }
 
-        # Save to session (even if all_rows is empty, the Game Tabs will still run)
         st.session_state["auto_df"] = pd.DataFrame(all_rows)
         st.session_state["game_proj_dict"] = game_projections
         st.session_state["sched_df"] = sched
