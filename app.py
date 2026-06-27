@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 import time
 from fractions import Fraction
 
-st.set_page_config(page_title="MLB Prop Analyser v2.1", page_icon="⚾", layout="wide")
+st.set_page_config(page_title="MLB Prop Analyser v2.2", page_icon="⚾", layout="wide")
 
 st.markdown("""
 <style>
@@ -308,17 +308,18 @@ def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
 
 # ── SIDEBAR ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚾ MLB Props v2.1")
-    # HARDCODED YOUR ODDS API KEY HERE
+    st.markdown("## ⚾ MLB Props v2.2")
     odds_key = st.text_input("The-Odds-API Key", value="4b959d673d4ef9c7128271557c038dfe", type="password", help="Live UK bookmaker odds key.")
     sel_date = st.date_input("Slate Date", value=date.today())
     st.markdown("---")
     st.markdown("### Filters")
-    min_avg  = st.slider("Min AVG",   0.100, 0.350, 0.180, 0.005, format="%.3f")
-    min_obp  = st.slider("Min OBP",   0.250, 0.400, 0.280, 0.005, format="%.3f")
-    min_pa   = st.slider("Min PA",    0, 200, 30, 10)
-    max_era  = st.slider("Max opp ERA", 1.5, 10.0, 10.0, 0.1)
-    max_ord  = st.slider("Max Order", 1, 9, 9)
+    # TIGHTENED ELITE DEFAULTS
+    min_avg  = st.slider("Min AVG",   0.100, 0.350, 0.240, 0.005, format="%.3f")
+    min_obp  = st.slider("Min OBP",   0.250, 0.400, 0.315, 0.005, format="%.3f")
+    min_pa   = st.slider("Min PA",    0, 300, 100, 10)
+    max_era  = st.slider("Max opp ERA", 1.5, 10.0, 4.50, 0.1)
+    max_ord  = st.slider("Max Order", 1, 9, 6)
+    
     st.markdown("### Markets")
     s_hits = st.checkbox("Hits/Runs",   True)
     s_rbi  = st.checkbox("RBI",         True)
@@ -367,7 +368,7 @@ with st.sidebar:
 allowed_markets = [m for m,s in [
     ("Hits/Runs",s_hits),("RBI",s_rbi),("Home Run",s_hr),("Runs Scored",s_runs)] if s]
 
-st.title("⚾ MLB Prop & Game Analyser v2.1")
+st.title("⚾ MLB Prop & Game Analyser v2.2")
 st.caption("Auto-fetches every MLB batter, probable pitchers, confirmed lineups, live weather, and game projections.")
 st.divider()
 
@@ -729,14 +730,18 @@ if "auto_df" in st.session_state:
 
         for tab, market in [(t_hits,"Hits/Runs"),(t_rbi,"RBI"),(t_hr,"Home Run"),(t_runs,"Runs Scored")]:
             with tab:
-                sub = df[df["Best Market"]==market]
+                # NEW LOGIC: Ranks the entire eligible slate independently based on the market's specific raw score
+                sub = df[df[market] > 0.0].sort_values(by=market, ascending=False)
+                
                 if sub.empty:
-                    st.info("No picks available for " + market); continue
+                    st.info("No batters met the mathematical criteria for " + market)
+                    continue
+                    
                 c_chart, c_cards = st.columns([3,2])
                 with c_chart:
                     fig = go.Figure(go.Bar(
                         y=sub.head(12)["Batter"]+" | "+sub.head(12)["Game"],
-                        x=sub.head(12)["Best Score"], orientation="h",
+                        x=sub.head(12)[market], orientation="h",
                         marker_color=MARKET_COLORS[market],
                         text=["ERA "+str(e) for e in sub.head(12)["Pitcher ERA"]],
                         textposition="inside", insidetextanchor="start",
@@ -757,14 +762,20 @@ if "auto_df" in st.session_state:
                                 st.markdown(f"**{row['Batter']}**")
                                 st.caption(f"Slot: #{int(row['Order'])} | {row['Game']} 🕒 {row['Game Time BST']}")
                             with card_right:
-                                st.metric(label="Score", value=f"{row['Best Score']:.1f}")
-                                st.markdown(f"**{row['Grade']}**")
+                                m_score = float(row[market])
+                                st.metric(label="Score", value=f"{m_score:.1f}")
+                                
+                                # Dynamic grading specific to this market's score
+                                if m_score >= 70.0: m_grade = "🟢 Premium"
+                                elif m_score >= 48.0: m_grade = "🟡 Playable"
+                                else: m_grade = "🔴 Sub-optimal"
+                                st.markdown(f"**{m_grade}**")
                             
                             st.markdown(f"🔬 `wRC+: {row['wRC+']}` | `OBP: {row['OBP']:.3f}` | `ISO: {row['ISO']:.3f}`")
                             st.markdown(f"🔥 `vs: {row['Opp Pitcher']} (ERA {row['Pitcher ERA']})` | {row['Pitcher Rating']}")
                             st.markdown(f"🏟️ `{row['Venue']}` | Conditions: `{row['Env Rating']}`")
                             st.divider()
-                            st.caption(f"💡 **Why back him:** {row['Rationale']}")
+                            st.caption(f"💡 **Overall Best Market:** {row['Best Market']} ({row['Rationale']})")
 
         # ── MONEYLINE OVERLAY ──
         with t_ml:
