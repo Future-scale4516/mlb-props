@@ -1,11 +1,12 @@
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
 import requests as req
 from datetime import date, datetime, timedelta
 import time
 from fractions import Fraction
 
-st.set_page_config(page_title="MLB Value Matrix v2.0", page_icon="⚾", layout="wide")
+st.set_page_config(page_title="MLB Value Matrix v2.2", page_icon="⚾", layout="wide")
 
 # ── MOBILE-FRIENDLY CSS ──
 st.markdown("""
@@ -202,7 +203,10 @@ def score_batter(b_stats, p_stats, order, env_factor):
 # ── SIDEBAR CONFIGURATION ──
 with st.sidebar:
     st.markdown("## ⚾ API Keys")
+    # ✅ PASTE YOUR TANK01 API KEY IN THE EMPTY QUOTES BELOW
     api_key_input = st.text_input("Tank01 API Key (RapidAPI)", value="", type="password")
+    
+    # ODDS API IS ALREADY HARDCODED FOR YOU HERE
     odds_key = st.text_input("The-Odds-API Key", value="4b959d673d4ef9c7128271557c038dfe", type="password")
     sel_date = st.date_input("Slate Date", value=date.today())
     
@@ -220,13 +224,13 @@ with st.sidebar:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
-st.title("⚾ MLB Value Matrix v2.0")
+st.title("⚾ MLB Value Matrix v2.2")
 st.caption("Decoupled Architecture: Game odds run independently of strict player prop filters.")
 st.divider()
 
 if st.button("Load Today's Slate", type="primary"):
     if not api_key_input:
-        st.warning("⚠️ Please enter your Tank01 API Key in the sidebar.")
+        st.warning("⚠️ Please enter your Tank01 API Key in the sidebar or hardcode it in the script.")
         st.stop()
         
     with st.status("Fetching decoupled data streams...", expanded=True) as status:
