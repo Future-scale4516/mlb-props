@@ -103,6 +103,30 @@ def fetch_schedule(target_date: str):
             })
     return pd.DataFrame(rows)
 
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_results(target_date: str):
+    """Final scores for completed games on a date (for backtesting). Free MLB data."""
+    data = safe_get("https://statsapi.mlb.com/api/v1/schedule", {
+        "sportId": 1, "date": target_date, "hydrate": "probablePitcher,team,linescore"})
+    out = []
+    for d in data.get("dates", []):
+        for g in d.get("games", []):
+            if g.get("status", {}).get("abstractGameState", "") != "Final":
+                continue
+            t = g.get("teams", {})
+            hs = t.get("home", {}).get("score")
+            as_ = t.get("away", {}).get("score")
+            if hs is None or as_ is None:
+                continue
+            out.append({
+                "home_team_id": t.get("home", {}).get("team", {}).get("id"),
+                "away_team_id": t.get("away", {}).get("team", {}).get("id"),
+                "home_prob_id": t.get("home", {}).get("probablePitcher", {}).get("id"),
+                "away_prob_id": t.get("away", {}).get("probablePitcher", {}).get("id"),
+                "home_score": int(hs), "away_score": int(as_)})
+    return out
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_all_mlb_batting_stats(season: int):
     data = safe_get("https://statsapi.mlb.com/api/v1/stats", {
@@ -804,6 +828,57 @@ def build_prop_edges(sel_date, max_games=6):
     return pd.DataFrame(rows, columns=cols), last_meta, note
 
 
+def _calib(recs, market):
+    """Calibration summary for one market: Brier, accuracy, and decile buckets."""
+    rows = [(p, o) for m, p, o in recs if m == market]
+    if not rows:
+        return None
+    n = len(rows)
+    brier = sum((p - o) ** 2 for p, o in rows) / n
+    acc = sum(1 for p, o in rows if (p >= 0.5) == (o == 1)) / n
+    base = sum(o for p, o in rows) / n
+    buckets = []
+    for k in range(10):
+        lo, hi = k / 10, k / 10 + 0.1
+        grp = [(p, o) for p, o in rows if (lo <= p < hi) or (hi >= 1.0 and p >= 1.0)]
+        if grp:
+            buckets.append((f"{int(lo*100)}-{int(hi*100)}%", len(grp),
+                            round(sum(p for p, o in grp) / len(grp) * 100, 1),
+                            round(sum(o for p, o in grp) / len(grp) * 100, 1)))
+    return {"n": n, "brier": round(brier, 4), "acc": round(acc * 100, 1),
+            "base_rate": round(base * 100, 1), "buckets": buckets}
+
+
+def run_backtest(sel_date, days_back=14):
+    """Score the game model against real final scores from recent completed games.
+    Returns (records, days_with_games) where each record is (market, pred_prob, outcome)."""
+    team_off, league_rpg = fetch_team_offense(sel_date.year)
+    recs, days_done = [], 0
+    for i in range(1, days_back + 1):
+        day = sel_date - timedelta(days=i)
+        results = fetch_results(str(day))
+        if not results:
+            continue
+        days_done += 1
+        for r in results:
+            hid = int(r.get("home_team_id") or 0)
+            aid = int(r.get("away_team_id") or 0)
+            home_rpg = team_off.get(hid, league_rpg)
+            away_rpg = team_off.get(aid, league_rpg)
+            park = PARK_FACTORS.get(hid, NEUTRAL_PARK)
+            away_sp = fetch_pitcher_stats(r.get("away_prob_id")) if r.get("away_prob_id") else {"era": 4.5}
+            home_sp = fetch_pitcher_stats(r.get("home_prob_id")) if r.get("home_prob_id") else {"era": 4.5}
+            mdl = model_game(home_rpg, away_rpg, away_sp.get("era", 4.5),
+                             home_sp.get("era", 4.5), league_rpg, LEAGUE_ERA_DEFAULT,
+                             8.5, park=park["run"])
+            total = r["home_score"] + r["away_score"]
+            margin = r["home_score"] - r["away_score"]
+            recs.append(("Moneyline (home win)", mdl["p_home_ml"], 1 if margin > 0 else 0))
+            recs.append(("Total Over 8.5", mdl["p_over"], 1 if total > 8.5 else 0))
+            recs.append(("Run line (home -1.5)", mdl["p_home_cover"], 1 if margin >= 2 else 0))
+    return recs, days_done
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_pitcher_stats(pitcher_id):
     if not pitcher_id or pd.isna(pitcher_id):
@@ -1146,6 +1221,50 @@ if st.button("Find player prop edges (US books)"):
                        "Model %: our probability · Market %: de-vigged book probability · "
                        "Best over: best decimal price across US books. The model is still "
                        "uncalibrated — paper-trade until it's backtested.")
+
+st.divider()
+st.markdown("## 📊 Model Backtest — calibration")
+st.caption("Checks the game model's probabilities against real final scores from recent "
+           "completed games. Well-calibrated means: when it says 60%, that happens about "
+           "60% of the time. Free (MLB results only) — no odds or quota needed.")
+bt_days = st.slider("Days of completed games to test", 3, 30, 14)
+if st.button("Run backtest"):
+    with st.spinner("Fetching results and scoring the model against them..."):
+        bt_recs, bt_days_done = run_backtest(sel_date, bt_days)
+    if not bt_recs:
+        st.warning("No completed games found in that window.")
+    else:
+        st.caption(f"Scored {len(bt_recs)//3} games across {bt_days_done} day(s). "
+                   "Lower Brier = better; the model line should hug the dashed diagonal.")
+        for bt_market in ["Moneyline (home win)", "Total Over 8.5", "Run line (home -1.5)"]:
+            c = _calib(bt_recs, bt_market)
+            if not c:
+                continue
+            st.markdown(f"#### {bt_market}")
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("Brier score", c["brier"])
+            mc2.metric("Accuracy", f"{c['acc']}%")
+            mc3.metric("Base rate", f"{c['base_rate']}%")
+            cdf = pd.DataFrame(c["buckets"],
+                               columns=["Predicted band", "Games", "Model avg %", "Actual %"])
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=[0, 100], y=[0, 100], mode="lines",
+                          line=dict(dash="dash", color="#aaa"), name="Perfect"))
+            fig.add_trace(go.Scatter(x=cdf["Model avg %"], y=cdf["Actual %"],
+                          mode="markers+lines", marker=dict(size=9, color="#a12c7b"),
+                          name="Model"))
+            fig.update_layout(height=300, xaxis_title="Model predicted %",
+                          yaxis_title="Actual %", plot_bgcolor="#f9f8f5",
+                          paper_bgcolor="#f7f6f2", margin=dict(l=10, r=10, t=10, b=10),
+                          xaxis=dict(range=[0, 100]), yaxis=dict(range=[0, 100]),
+                          font=dict(family="Inter"))
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(cdf, use_container_width=True, hide_index=True)
+        st.caption("Caveats: uses current-season team/pitcher stats applied to past games "
+                   "(mild lookahead), a fixed 8.5 totals line, and a league-average starter "
+                   "when a probable isn't listed. This validates the model's calibration, "
+                   "NOT whether you'd beat a bookmaker — a true profit backtest needs "
+                   "historical odds (a paid feature) or forward-logged predictions over time.")
 
 if load_btn:
     with st.status("Loading today's slate...", expanded=True) as status:
