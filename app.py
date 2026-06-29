@@ -5,6 +5,18 @@ import requests as req
 from datetime import date, datetime, timedelta
 import time
 
+def get_secret(name: str, default: str = "") -> str:
+    """Read an API key from Streamlit secrets (Settings → Secrets on the app
+    dashboard), falling back to an environment variable, then a default.
+    Never hard-code keys in the source."""
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    import os
+    return os.environ.get(name, default)
+
 st.set_page_config(page_title="MLB Prop Analyser v2", page_icon="⚾", layout="wide")
 
 st.markdown("""
