@@ -266,6 +266,44 @@ LEAGUE_ERA_DEFAULT = 4.10   # league ERA (fallback)
 SP_WEIGHT = 0.60            # share of a game credited to the starting pitcher
 
 
+# Run / HR park factors (1.00 = neutral), keyed by MLB team_id of the HOME park.
+# Approximate 2026 values; relative ordering matters most and these are easy to tune.
+PARK_FACTORS = {
+    108: {"run": 0.99, "hr": 1.01},  # LAA  Angel Stadium
+    109: {"run": 1.03, "hr": 1.02},  # ARI  Chase Field
+    110: {"run": 1.01, "hr": 1.04},  # BAL  Camden Yards
+    111: {"run": 1.06, "hr": 0.99},  # BOS  Fenway Park
+    112: {"run": 1.01, "hr": 1.01},  # CHC  Wrigley Field
+    113: {"run": 1.08, "hr": 1.12},  # CIN  Great American Ball Park
+    114: {"run": 0.99, "hr": 1.01},  # CLE  Progressive Field
+    115: {"run": 1.14, "hr": 1.12},  # COL  Coors Field
+    116: {"run": 0.96, "hr": 0.93},  # DET  Comerica Park
+    117: {"run": 1.01, "hr": 1.03},  # HOU  Daikin Park
+    118: {"run": 0.99, "hr": 0.96},  # KC   Kauffman Stadium
+    119: {"run": 1.01, "hr": 1.04},  # LAD  Dodger Stadium
+    120: {"run": 1.00, "hr": 1.01},  # WSH  Nationals Park
+    121: {"run": 0.97, "hr": 0.95},  # NYM  Citi Field
+    133: {"run": 1.02, "hr": 1.08},  # ATH  Sutter Health Park (Sacramento)
+    134: {"run": 0.97, "hr": 0.92},  # PIT  PNC Park
+    135: {"run": 0.95, "hr": 0.96},  # SD   Petco Park
+    136: {"run": 0.94, "hr": 0.93},  # SEA  T-Mobile Park
+    137: {"run": 0.92, "hr": 0.89},  # SF   Oracle Park
+    138: {"run": 0.98, "hr": 0.96},  # STL  Busch Stadium
+    139: {"run": 0.96, "hr": 0.95},  # TB   Tropicana Field
+    140: {"run": 1.01, "hr": 1.02},  # TEX  Globe Life Field
+    141: {"run": 1.02, "hr": 1.03},  # TOR  Rogers Centre
+    142: {"run": 1.00, "hr": 1.00},  # MIN  Target Field
+    143: {"run": 1.03, "hr": 1.06},  # PHI  Citizens Bank Park
+    144: {"run": 0.99, "hr": 1.01},  # ATL  Truist Park
+    145: {"run": 1.01, "hr": 1.05},  # CWS  Rate Field
+    146: {"run": 0.95, "hr": 0.93},  # MIA  loanDepot Park
+    147: {"run": 1.02, "hr": 1.08},  # NYY  Yankee Stadium
+    158: {"run": 1.02, "hr": 1.03},  # MIL  American Family Field
+}
+
+NEUTRAL_PARK = {"run": 1.0, "hr": 1.0}
+
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_team_offense(season: int):
     """Team runs/game from the MLB Stats API. Returns (dict{team_id: rpg}, league_rpg)."""
@@ -392,6 +430,31 @@ def edge_ev(model_p, fair_p, best_odds):
     return edge, ev
 
 
+def _edge_light(edge):
+    """Traffic-light banding for an edge (percentage points).
+    grey <2 (no signal) · green 2-8 (value zone) · amber 8-15 (suspect) ·
+    red 15+ (almost certainly a missing model input, not real value)."""
+    if edge is None:
+        return ""
+    if edge >= 15:
+        return "🔴"
+    if edge >= 8:
+        return "🟡"
+    if edge >= 2:
+        return "🟢"
+    return "⚪"
+
+
+def _commence_to_bst(iso):
+    """Convert The Odds API commence_time (ISO UTC) to a BST HH:MM string
+    (BST = UTC+1 during the MLB season)."""
+    try:
+        dt = datetime.strptime(iso.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+        return (dt + timedelta(hours=1)).strftime("%H:%M")
+    except Exception:
+        return ""
+
+
 def build_game_edges(sel_date):
     """Match today's games to UK odds, run the model, return (df, note, meta)."""
     sched = fetch_schedule(str(sel_date))
@@ -407,7 +470,7 @@ def build_game_edges(sel_date):
     def norm(s): return (s or "").lower().strip()
     odds_index = {(norm(g.get("home_team")), norm(g.get("away_team"))): g for g in odds_data}
 
-    rows, unmatched = [], []
+    rows, unmatched, game_time = [], [], {}
     for _, gm in sched.iterrows():
         home, away = gm.get("home_team"), gm.get("away_team")
         og = odds_index.get((norm(home), norm(away)))
@@ -425,10 +488,13 @@ def build_game_edges(sel_date):
         away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
         home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
         cons = consolidate_odds(og, og.get("home_team"), og.get("away_team"))
+        pf = PARK_FACTORS.get(int(gm.get("home_team_id") or 0), NEUTRAL_PARK)
         mdl = model_game(home_rpg, away_rpg, away_sp.get("era", 4.5),
                          home_sp.get("era", 4.5), league_rpg, LEAGUE_ERA_DEFAULT,
-                         cons.get("total_line"))
+                         cons.get("total_line"), park=pf["run"])
         gl = f"{away} @ {home}"
+        ct = og.get("commence_time") or ""
+        game_time[gl] = (ct, _commence_to_bst(ct))
 
         fh, fa = devig_two(cons["ml_home"], cons["ml_away"])
         if fh is not None:
@@ -458,7 +524,9 @@ def build_game_edges(sel_date):
     df["Fair %"] = (df["Fair %"] * 100).round(1)
     df["Edge"] = df["Edge"].round(1)
     df["EV %"] = df["EV %"].round(1)
-    df = df.sort_values("Edge", ascending=False).reset_index(drop=True)
+    df["_ct"] = df["Game"].map(lambda g: game_time.get(g, ("", ""))[0])
+    df["Start"] = df["Game"].map(lambda g: game_time.get(g, ("", ""))[1])
+    df = df.sort_values(["_ct", "Game"]).reset_index(drop=True)
     note = (f"Couldn't match odds for: {', '.join(unmatched)}" if unmatched else "")
     return df, note, meta
 
@@ -547,8 +615,11 @@ def order_factor(order):
     return {1:1.00,2:0.97,3:0.97,4:0.95,5:0.93,6:0.90,7:0.87,8:0.84,9:0.80}.get(int(order or 9),0.80)
 
 def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
-                 order, era, whip, hr9, k9, park_factor, temp, wind, dome, use_adv, w_era, w_whip):
-    env = park_factor * wx_modifier(temp, wind, dome)
+                 order, era, whip, hr9, k9, park_factor, temp, wind, dome, use_adv, w_era, w_whip,
+                 park_run=1.0, park_hr=1.0):
+    weather = park_factor * wx_modifier(temp, wind, dome)
+    env     = weather * park_run   # structural park factor for hits / RBI / runs
+    env_hr  = weather * park_hr    # structural park factor for home runs
     of  = order_factor(order)
     pv  = min(era/7.0,1.0)*w_era + min(max((whip-0.8)/1.2,0.0),1.0)*w_whip
     hrv = min(hr9/2.5,1.0)
@@ -567,7 +638,7 @@ def score_batter(avg, obp, slg, iso, ops, k_pct, hard_hit, barrel, wrc_plus,
         
     hits_runs_score = round(contact * pv * of * k_adj * env * 280, 2)
     rbi_score       = round(contact * pv * rbi_of * k_adj * env * 260, 2)
-    hr_score        = round(power   * hrv * env * 280, 2)
+    hr_score        = round(power   * hrv * env_hr * 280, 2)
     runs_score      = round(on_base * pv * run_of * k_adj * env * 280, 2)
 
     if iso < 0.130 or barrel < 0.04 or hr9 < 0.7:
@@ -688,8 +759,6 @@ st.caption("Estimates each team's runs with a Poisson model (starting pitchers +
            "offence), then compares to de-vigged UK odds to surface edges. Positive edge = "
            "model rates the bet better than the market price. Always confirm the live price "
            "at your book before staking — lines move.")
-gb_min = st.slider("Minimum edge to flag as a value bet (percentage points)",
-                   0.0, 15.0, 2.0, 0.5)
 if st.button("Analyse game bets (UK odds)"):
     with st.spinner("Fetching schedule, team stats, pitchers and UK odds..."):
         gdf, gnote, gmeta = build_game_edges(sel_date)
@@ -701,25 +770,47 @@ if st.button("Analyse game bets (UK odds)"):
                        f"remaining {gmeta.get('remaining')}")
         if gnote:
             st.info(gnote)
-        value = gdf[gdf["Edge"] >= gb_min]
-        st.markdown(f"### \u2705 Value bets (edge \u2265 {gb_min} pts): {len(value)}")
+        green = int(((gdf["Edge"] >= 2) & (gdf["Edge"] < 8)).sum())
+        amber = int(((gdf["Edge"] >= 8) & (gdf["Edge"] < 15)).sum())
+        red = int((gdf["Edge"] >= 15).sum())
+        st.markdown(f"### 🟢 {green} green · 🟡 {amber} amber · 🔴 {red} red")
+        st.caption("🟢 2–8 pts = believable value · 🟡 8–15 = treat with caution · "
+                   "🔴 15+ = almost certainly a missing model input, not a real edge · "
+                   "⚪ under 2 = no signal.")
         cfg = {
+            "🚦": st.column_config.TextColumn("", width="small"),
+            "Start": st.column_config.TextColumn("Start (BST)", width="small"),
+            "Game": st.column_config.TextColumn("Game", width="medium"),
+            "Selection": st.column_config.TextColumn("Selection", width="medium"),
             "Model %": st.column_config.NumberColumn("Model %", format="%.1f"),
             "Fair %": st.column_config.NumberColumn("Fair %", format="%.1f"),
             "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f"),
             "Odds": st.column_config.NumberColumn("Best odds", format="%.2f"),
             "EV %": st.column_config.NumberColumn("EV %", format="%.1f"),
-            "Selection": st.column_config.TextColumn("Selection", width="medium"),
-            "Game": st.column_config.TextColumn("Game", width="medium"),
         }
-        if not value.empty:
-            st.dataframe(value, use_container_width=True, hide_index=True, column_config=cfg)
-        else:
-            st.write("No bets clear your edge threshold today.")
-        with st.expander("Show all markets (full breakdown)"):
-            st.dataframe(gdf, use_container_width=True, hide_index=True, column_config=cfg)
-        st.caption("Model %: our probability. Fair %: book's de-vigged probability. "
-                   "Edge: model minus fair. EV %: expected return per unit stake at best odds.")
+
+        def show_market(tab, market_name):
+            with tab:
+                sub = gdf[gdf["Market"] == market_name].sort_values(
+                    ["_ct", "Game"]).reset_index(drop=True)
+                if sub.empty:
+                    st.write("No odds available for this market today.")
+                    return
+                sub = sub.copy()
+                sub.insert(0, "🚦", sub["Edge"].apply(_edge_light))
+                disp = sub[["🚦", "Start", "Game", "Selection",
+                            "Model %", "Fair %", "Edge", "Odds", "EV %"]]
+                st.dataframe(disp, use_container_width=True, hide_index=True,
+                             column_config=cfg)
+
+        ml_tab, rl_tab, tot_tab = st.tabs(["💰 Money Line", "📏 Run Line", "📊 Totals"])
+        show_market(ml_tab, "Moneyline")
+        show_market(rl_tab, "Run line")
+        show_market(tot_tab, "Total")
+        st.caption("Model %: our probability · Fair %: book's de-vigged probability · "
+                   "Edge: model minus fair · EV %: expected return per unit stake at best "
+                   "odds. Heads-up: very large edges (15+ pts) usually mean the model is "
+                   "missing an input for that game (e.g. ballpark) rather than real value.")
 
 if load_btn:
     with st.status("Loading today's slate...", expanded=True) as status:
@@ -772,6 +863,7 @@ if load_btn:
             home_pitch["name"] = g["home_prob_name"]
 
             total_env = wx["factor"] * wx_modifier(wx["temp"], wx["wind"], wx["dome"])
+            g_pf = PARK_FACTORS.get(int(g["home_team_id"]), NEUTRAL_PARK)
             if total_env >= 1.06:
                 env_symbol = "🟢 Hitter-Friendly"
             elif total_env >= 0.97:
@@ -839,7 +931,8 @@ if load_btn:
                         avg_v, obp_v, slg_v, iso_v, ops_v, k_pct, hard_hit, barrel, wrc_plus,
                         order, opp_pitch["era"], opp_pitch["whip"], opp_pitch["homeRunsPer9"],
                         opp_pitch.get("strikeoutsPer9Inn",8.5), wx["factor"], wx["temp"], wx["wind"],
-                        wx["dome"], use_adv, w_era, w_whip
+                        wx["dome"], use_adv, w_era, w_whip,
+                        g_pf["run"], g_pf["hr"]
                     )
                     flt = {k:v for k,v in scores.items() if k in allowed_markets}
                     if not flt: continue
