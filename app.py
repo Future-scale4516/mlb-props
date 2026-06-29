@@ -5,18 +5,6 @@ import requests as req
 from datetime import date, datetime, timedelta
 import time
 
-def get_secret(name: str, default: str = "") -> str:
-    """Read an API key from Streamlit secrets (Settings → Secrets on the app
-    dashboard), falling back to an environment variable, then a default.
-    Never hard-code keys in the source."""
-    try:
-        if name in st.secrets:
-            return str(st.secrets[name])
-    except Exception:
-        pass
-    import os
-    return os.environ.get(name, default)
-
 st.set_page_config(page_title="MLB Prop Analyser v2", page_icon="⚾", layout="wide")
 
 st.markdown("""
@@ -221,6 +209,56 @@ def fetch_savant_stats(season: int):
         st.session_state["savant_error"] = f"{type(e).__name__}: {e}"
         return pd.DataFrame()
 
+def get_secret(name: str, default: str = "") -> str:
+    """Read an API key from Streamlit secrets (Settings -> Secrets on the app
+    dashboard), falling back to an environment variable, then a default.
+    Never hard-code keys in the source."""
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    import os
+    return os.environ.get(name, default)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_mlb_odds(regions: str = "us", markets: str = "h2h,spreads,totals",
+                   odds_format: str = "decimal"):
+    """Fetch MLB game odds from The Odds API.
+    Returns (data, meta) where data is a list of game dicts and meta carries
+    quota info + any error. Cached 15 min to protect the free-tier quota.
+    h2h = moneyline, spreads = run line, totals = over/under.
+    NB: spreads/totals for MLB live on US books, so regions='us' even from the UK;
+    odds_format='decimal' still returns UK-style prices."""
+    key = get_secret("ODDS_API_KEY")
+    if not key:
+        return [], {"error": "No ODDS_API_KEY found in Streamlit secrets."}
+    url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
+    try:
+        r = req.get(url, params={
+            "apiKey": key, "regions": regions, "markets": markets,
+            "oddsFormat": odds_format, "dateFormat": "iso",
+        }, timeout=15)
+    except Exception as e:
+        return [], {"error": f"Request failed: {e}"}
+    meta = {
+        "status": r.status_code,
+        "remaining": r.headers.get("x-requests-remaining"),
+        "used": r.headers.get("x-requests-used"),
+        "error": "",
+    }
+    if r.status_code != 200:
+        meta["error"] = f"HTTP {r.status_code}: {r.text[:300]}"
+        return [], meta
+    try:
+        data = r.json()
+    except Exception as e:
+        meta["error"] = f"Bad JSON: {e}"
+        return [], meta
+    return data, meta
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_pitcher_stats(pitcher_id):
     if not pitcher_id or pd.isna(pitcher_id):
@@ -414,6 +452,31 @@ with col_info:
     st.markdown("""
     **Auto-loads:** MLB schedule · probable pitchers · **all 500+ batters** (MLB Stats API) · Fangraphs advanced stats (if available) · confirmed lineups · live ballpark weather
     """)
+
+with st.expander("🔌 Odds API connection test (The Odds API)"):
+    st.caption("Runs one request against your quota. Use it to confirm the key works "
+               "and see which markets your plan returns.")
+    if st.button("Run odds API test"):
+        odds_data, odds_meta = fetch_mlb_odds()
+        if odds_meta.get("error"):
+            st.error(odds_meta["error"])
+        else:
+            st.success(f"Connected — {len(odds_data)} MLB games returned.")
+            st.write(f"Quota — used: {odds_meta.get('used')} | "
+                     f"remaining: {odds_meta.get('remaining')}")
+            present = set()
+            for g in odds_data:
+                for b in g.get("bookmakers", []):
+                    for m in b.get("markets", []):
+                        present.add(m.get("key"))
+            label = {"h2h": "moneyline", "spreads": "run line", "totals": "over/under"}
+            shown = ", ".join(f"{k} ({label.get(k, k)})" for k in sorted(present)) or "none"
+            st.write("Markets returned:", shown)
+            if odds_data:
+                g = odds_data[0]
+                st.write(f"Sample game: {g.get('away_team')} @ {g.get('home_team')}  "
+                         f"(start {g.get('commence_time')})")
+                st.json((g.get("bookmakers") or [{}])[0])
 
 if load_btn:
     with st.status("Loading today's slate...", expanded=True) as status:
