@@ -136,20 +136,77 @@ def fetch_all_mlb_batting_stats(season: int):
         })
     return pd.DataFrame(rows)
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_fangraphs_stats(season: int):
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_savant_stats(season: int):
+    """Advanced batting metrics from Baseball Savant (Statcast) via pybaseball.
+    Savant serves CSV leaderboards reliably from cloud IPs, unlike the Fangraphs
+    scrape which gets blocked on Streamlit Cloud. Keyed by MLBAM player_id."""
+    st.session_state["savant_error"] = ""
+    st.session_state["savant_debug"] = ""
     try:
-        from pybaseball import batting_stats
-        df = batting_stats(season, qual=50)
-        col_map = {"Name":"name","AVG":"avg","OBP":"obp","SLG":"slg","ISO":"iso",
-                   "wRC+":"wrc_plus","K%":"k_pct","BB%":"bb_pct",
-                   "HardHit%":"hard_hit_pct","Barrel%":"barrel_pct","HR":"hr","G":"games"}
-        df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
-        for pct in ["k_pct","bb_pct","hard_hit_pct","barrel_pct"]:
-            if pct in df.columns and df[pct].max() > 1:
-                df[pct] = df[pct] / 100
+        from pybaseball import (statcast_batter_exitvelo_barrels,
+                                statcast_batter_expected_stats)
+
+        ev = statcast_batter_exitvelo_barrels(season)   # Barrel%, HardHit%
+        xs = statcast_batter_expected_stats(season)     # xwOBA, xSLG, xBA
+
+        def pick(df, *cands):
+            for c in cands:
+                if c in df.columns:
+                    return c
+            return None
+
+        # exit velocity / barrels leaderboard
+        ev_id = pick(ev, "player_id")
+        brl_c = pick(ev, "brl_percent", "barrel_batted_rate", "brl_pa")
+        hh_c  = pick(ev, "ev95percent", "hard_hit_percent", "ev95per")
+        ev_keep = ev[[c for c in [ev_id, brl_c, hh_c] if c]].rename(
+            columns={ev_id: "player_id", brl_c: "barrel_pct", hh_c: "hard_hit_pct"})
+
+        # expected stats leaderboard
+        xs_id    = pick(xs, "player_id")
+        xwoba_c  = pick(xs, "est_woba", "xwoba")
+        xslg_c   = pick(xs, "est_slg", "xslg")
+        xba_c    = pick(xs, "est_ba", "xba")
+        xs_keep = xs[[c for c in [xs_id, xwoba_c, xslg_c, xba_c] if c]].rename(
+            columns={xs_id: "player_id", xwoba_c: "xwoba", xslg_c: "xslg", xba_c: "xba"})
+
+        df = pd.merge(xs_keep, ev_keep, on="player_id", how="outer")
+
+        # percentages -> fractions, to match score_batter()'s scale
+        for pct in ["barrel_pct", "hard_hit_pct"]:
+            if pct in df.columns and df[pct].dropna().max() > 1:
+                df[pct] = df[pct] / 100.0
+
+        # wRC+ proxy from xwOBA (affine fit: league wOBA ~.320 -> 100). Tune later.
+        LEAGUE_WOBA = 0.320
+        if "xwoba" in df.columns:
+            df["wrc_plus"] = (100 + (df["xwoba"] - LEAGUE_WOBA) * 712.5).round()
+
+        df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
+
+        # optional baserunning (XBR proxy) via sprint speed -- non-fatal if missing
+        try:
+            from pybaseball import statcast_sprint_speed
+            sp = statcast_sprint_speed(season, 10)
+            sp_id = pick(sp, "player_id")
+            sp_c  = pick(sp, "sprint_speed")
+            if sp_id and sp_c:
+                sp_keep = sp[[sp_id, sp_c]].rename(
+                    columns={sp_id: "player_id", sp_c: "sprint_speed"})
+                sp_keep["player_id"] = pd.to_numeric(sp_keep["player_id"], errors="coerce")
+                df = pd.merge(df, sp_keep, on="player_id", how="left")
+        except Exception as e:
+            st.session_state["savant_debug"] += f" [sprint_speed skipped: {e}]"
+
+        missing = [c for c in ["barrel_pct", "hard_hit_pct", "xwoba"] if c not in df.columns]
+        if missing:
+            st.session_state["savant_error"] = (
+                f"Couldn't find columns {missing}. "
+                f"exitvelo cols={list(ev.columns)} | expected cols={list(xs.columns)}")
         return df
-    except:
+    except Exception as e:
+        st.session_state["savant_error"] = f"{type(e).__name__}: {e}"
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -358,12 +415,19 @@ if load_btn:
         mlb_all = fetch_all_mlb_batting_stats(sel_date.year)
         st.write(f"MLB batting stats: {len(mlb_all)} players")
 
-        st.write("Trying Fangraphs advanced stats (wRC+, Hard Hit%, Barrel%)...")
-        fg_df = fetch_fangraphs_stats(sel_date.year)
+        st.write("Loading Baseball Savant advanced stats (xwOBA, Barrel%, HardHit%)...")
+        fg_df = fetch_savant_stats(sel_date.year)
+        savant_map = {}
         if fg_df.empty:
-            st.write("Fangraphs unavailable — using MLB API stats with derived metrics")
+            reason = st.session_state.get("savant_error", "")
+            st.warning(f"Savant unavailable — using MLB API derived metrics. {reason}")
         else:
-            st.write(f"Fangraphs loaded: {len(fg_df)} batters")
+            st.write(f"Savant loaded: {len(fg_df)} batters")
+            if st.session_state.get("savant_error"):
+                st.warning(st.session_state["savant_error"])
+            tmp = fg_df.dropna(subset=["player_id"]).copy()
+            tmp["player_id"] = tmp["player_id"].astype(int)
+            savant_map = tmp.set_index("player_id").to_dict("index")
 
         all_rows = []
         for _, g in sched.iterrows():
@@ -436,17 +500,15 @@ if load_btn:
                     wrc_plus = int(max(1, float(base.get("ops",0.700) or 0.700) * 152))
                     hard_hit = min(0.65, 0.28 + float(base.get("iso",0)) * 1.2)
                     barrel   = min(0.20, float(base.get("iso",0)) * 0.35)
-                    if not fg_df.empty and "name" in fg_df.columns:
-                        fg_match = fg_df[fg_df["name"].str.lower() == pname.lower()]
-                        if fg_match.empty:
-                            last = pname.split()[-1].lower() if pname else ""
-                            fg_match = fg_df[fg_df["name"].str.lower().str.endswith(last, na=False)]
-                        if not fg_match.empty:
-                            fg = fg_match.iloc[0]
-                            wrc_plus = int(fg.get("wrc_plus",wrc_plus) or wrc_plus)
-                            hard_hit = float(fg.get("hard_hit_pct",hard_hit) or hard_hit)
-                            barrel   = float(fg.get("barrel_pct",barrel) or barrel)
-                            use_adv  = True
+                    srow = savant_map.get(pid)
+                    if srow:
+                        wv = srow.get("wrc_plus")
+                        if wv is not None and not pd.isna(wv): wrc_plus = int(wv)
+                        hv = srow.get("hard_hit_pct")
+                        if hv is not None and not pd.isna(hv): hard_hit = float(hv)
+                        bv = srow.get("barrel_pct")
+                        if bv is not None and not pd.isna(bv): barrel = float(bv)
+                        use_adv = True
 
                     avg_v  = float(base.get("avg",0))
                     obp_v  = float(base.get("obp",0))
@@ -591,10 +653,8 @@ if "auto_df" in st.session_state:
             
             disp = [c for c in SHOW + ["Best Market", "Best Score", "Lineup Status"] if c in filtered_df.columns]
             st.dataframe(filtered_df[disp].reset_index(drop=True), use_container_width=True, hide_index=True,
-            column_config={
-                "Batter": st.column_config.TextColumn("Batter", width="medium"),
-                "Game": st.column_config.TextColumn("Game", width="medium"),
-                "Best Score": st.column_config.ProgressColumn("Best Score", min_value=0, max_value=max_score, format="%.1f", color="#a12c7b"),
+                column_config={
+                    "Best Score": st.column_config.ProgressColumn("Best Score", min_value=0, max_value=max_score, format="%.1f", color="#a12c7b"),
                     "AVG": st.column_config.NumberColumn("BA", format="%.3f"),
                     "OBP": st.column_config.NumberColumn(format="%.3f"),
                     "ISO": st.column_config.NumberColumn(format="%.3f"),
@@ -693,18 +753,15 @@ if "auto_df" in st.session_state:
                 c_chart, c_cards = st.columns([3,2])
                 with c_chart:
                     fig = go.Figure(go.Bar(
-                        y=sub.head(12)["Batter"],
+                        y=sub.head(12)["Batter"]+" | "+sub.head(12)["Game"],
                         x=sub.head(12)["Best Score"], orientation="h",
                         marker_color=MARKET_COLORS[market],
                         text=["ERA "+str(e) for e in sub.head(12)["Pitcher ERA"]],
                         textposition="inside", insidetextanchor="start",
                         textfont=dict(color="white",size=11),
-                        customdata=sub.head(12)["Game"],
-                        hovertemplate="%{y}<br>%{customdata}<br>Score: %{x:.1f}<extra></extra>",
                     ))
                     fig.update_layout(title="Top "+market+" Picks",
-                        yaxis=dict(autorange="reversed", automargin=True, tickfont=dict(size=12)),
-                        height=460,
+                        yaxis=dict(autorange="reversed"), height=460,
                         plot_bgcolor="#f9f8f5", paper_bgcolor="#f7f6f2",
                         margin=dict(l=10,r=10,t=40,b=20), font=dict(family="Inter"))
                     st.plotly_chart(fig, use_container_width=True)
