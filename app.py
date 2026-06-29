@@ -671,6 +671,139 @@ def fetch_event_market_keys(event_id, regions="us"):
     return sorted(keys), meta
 
 
+def _prop_reason(mkey, srow, opp_hr9, opp_k9, park, order):
+    """Short, honest explanation of what is pushing a prop edge into the green/amber."""
+    spa = max(srow.get("plateAppearances", 1) or 1, 1)
+    bits = []
+    if mkey == "batter_home_runs":
+        if srow.get("hr", 0) / spa >= 0.045:
+            bits.append(f"strong power ({srow.get('hr', 0)} HR)")
+        if opp_hr9 >= 1.4:
+            bits.append(f"HR-prone starter ({opp_hr9:.1f} HR/9)")
+        if park["hr"] >= 1.05:
+            bits.append("hitter-friendly park")
+    elif mkey == "batter_hits":
+        if srow.get("avg", 0) >= 0.285:
+            bits.append(f"high contact (.{int(round(srow.get('avg', 0) * 1000)):03d} AVG)")
+        if opp_k9 <= 7.5:
+            bits.append(f"low-strikeout starter ({opp_k9:.1f} K/9)")
+        if park["run"] >= 1.05:
+            bits.append("hitter-friendly park")
+    else:  # rbi / runs
+        if order and order <= 5:
+            bits.append(f"bats #{order} (more chances)")
+        rate = (srow.get("rbi", 0) if mkey == "batter_rbis" else srow.get("runs", 0)) / spa
+        if rate >= 0.13:
+            bits.append("high rate for this market")
+        if park["run"] >= 1.05:
+            bits.append("hitter-friendly park")
+    if not bits:
+        return "Edge from market pricing, not a standout matchup"
+    return ("; ".join(bits[:3]))[:1].upper() + ("; ".join(bits[:3]))[1:]
+
+
+def build_prop_edges(sel_date, max_games=6):
+    """Full slate prop edges: per-game props adjusted for the opposing starter and
+    ballpark. Returns (df, meta, note). Green+amber only (edge 2-15) is filtered in UI."""
+    sched = fetch_schedule(str(sel_date))
+    if sched.empty:
+        return None, {}, "No games scheduled for this date."
+    odds_games, meta = fetch_mlb_odds(regions="uk")
+    if not odds_games:
+        return None, meta, "No games/odds available."
+    bat = fetch_all_mlb_batting_stats(sel_date.year)
+    if bat.empty:
+        return None, meta, "No batter stats available."
+    name_map = {str(n).lower(): row for n, row in zip(bat["name"], bat.to_dict("records"))}
+
+    def norm(s): return (s or "").lower().strip()
+    sched_index = {(norm(gm.get("home_team")), norm(gm.get("away_team"))): gm
+                   for _, gm in sched.iterrows()}
+
+    PROP_MARKETS = "batter_home_runs,batter_hits,batter_rbis,batter_runs_scored"
+    LABEL = {"batter_home_runs": "Home Run", "batter_hits": "Hits",
+             "batter_rbis": "RBI", "batter_runs_scored": "Runs"}
+    cols = ["Market", "Light", "Player", "Game", "Line",
+            "Model %", "Market %", "Edge", "Best over", "Reason"]
+    rows, unmatched = [], []
+    analysed, last_meta = 0, meta
+
+    for ev in odds_games:
+        if analysed >= max_games:
+            break
+        home, away = ev.get("home_team"), ev.get("away_team")
+        gm = sched_index.get((norm(home), norm(away)))
+        if gm is None:
+            hk = norm(home).split()[-1] if norm(home).split() else ""
+            ak = norm(away).split()[-1] if norm(away).split() else ""
+            for (oh, oa), cand in sched_index.items():
+                if hk and ak and oh.endswith(hk) and oa.endswith(ak):
+                    gm = cand; break
+        if gm is None:
+            unmatched.append(f"{away} @ {home}"); continue
+
+        event, em = fetch_event_props(ev.get("id"), PROP_MARKETS, regions="us")
+        analysed += 1
+        if em.get("remaining"):
+            last_meta = em
+        if em.get("error") or not event:
+            continue
+
+        home_id = int(gm.get("home_team_id") or 0)
+        away_id = int(gm.get("away_team_id") or 0)
+        park = PARK_FACTORS.get(home_id, NEUTRAL_PARK)
+        away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
+        home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
+        order_map = {}
+        try:
+            lu = fetch_live_lineups(int(gm.get("gamePk")))
+            for side in ("home", "away"):
+                d = lu.get(side)
+                if d is not None and not d.empty and "order" in d.columns:
+                    for _, r in d.iterrows():
+                        order_map[int(r["player_id"])] = int(r["order"])
+        except Exception:
+            pass
+
+        gl = f"{away} @ {home}"
+        for mkey in PROP_MARKETS.split(","):
+            for player, od in consolidate_prop(event, mkey).items():
+                srow = name_map.get(player.lower())
+                if not srow:
+                    ln = player.lower().split()[-1] if player else ""
+                    srow = next((v for k, v in name_map.items() if k.split()[-1] == ln), None)
+                if not srow:
+                    continue
+                pid = int(srow.get("player_id") or 0)
+                tid = int(srow.get("team_id") or 0)
+                if tid == home_id:
+                    opp = away_sp
+                elif tid == away_id:
+                    opp = home_sp
+                else:
+                    opp = {"homeRunsPer9": LG_HR9, "strikeoutsPer9Inn": LG_K9}
+                opp_hr9 = float(opp.get("homeRunsPer9", LG_HR9) or LG_HR9)
+                opp_k9 = float(opp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
+                order = order_map.get(pid, 5)
+                lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9,
+                                           park["hr"], park["run"])
+                mp = _p_over_line(lam[mkey], od["point"])
+                bp, mode = market_prob(od["over"], od["under"])
+                if mp is None or bp is None:
+                    continue
+                edge = (mp - bp) * 100
+                if not (2.0 <= edge < 15.0):
+                    continue
+                rows.append([LABEL[mkey], _edge_light(edge), player, gl, f"O{od['point']}",
+                             round(mp * 100, 1), round(bp * 100, 1), round(edge, 1),
+                             od["over_best"], _prop_reason(mkey, srow, opp_hr9, opp_k9, park, order)])
+
+    note = f"Analysed {analysed} game(s)."
+    if unmatched:
+        note += f" Couldn't match: {', '.join(unmatched[:4])}."
+    return pd.DataFrame(rows, columns=cols), last_meta, note
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_pitcher_stats(pitcher_id):
     if not pitcher_id or pd.isna(pitcher_id):
@@ -953,82 +1086,66 @@ if st.button("Analyse game bets (UK odds)"):
                    "missing an input for that game (e.g. ballpark) rather than real value.")
 
 st.divider()
-st.markdown("## 🎰 Player Prop Edges — probe (stage 1)")
-st.caption("Player props live on US books and are pulled one game at a time, so this first "
-           "stage confirms your plan serves them and previews model-vs-market edges for a "
-           "single game before we scale to the whole slate. Costs ~5 quota credits.")
-PROP_MARKETS = "batter_home_runs,batter_hits,batter_rbis,batter_runs_scored"
-PROP_LABEL = {"batter_home_runs": "Home Run", "batter_hits": "Hits",
-              "batter_rbis": "RBI", "batter_runs_scored": "Runs"}
-if st.button("Probe player prop odds (1 game)"):
-    with st.spinner("Checking prop availability and pulling one game's props..."):
-        odds_games, _m = fetch_mlb_odds(regions="uk")
-    if not odds_games:
-        st.warning("No games available to probe right now.")
+st.markdown("## 🎰 Player Prop Edges")
+st.caption("Pulls US-book player props per game, estimates each batter's probability with the "
+           "opposing starter and ballpark factored in, and surfaces green/amber value bets "
+           "(edge 2–15 pts). Each game analysed costs 4 quota credits.")
+pc1, pc2 = st.columns([2, 3])
+with pc1:
+    prop_max_games = st.slider("Games to analyse (4 credits each)", 1, 20, 6)
+with pc2:
+    st.caption(f"Projected cost: up to {prop_max_games * 4} credits. "
+               "Cached 15 min, so re-viewing the same games is free.")
+if st.button("Find player prop edges (US books)"):
+    with st.spinner("Pulling props, starters and park factors per game..."):
+        prop_df, prop_meta, prop_note = build_prop_edges(sel_date, prop_max_games)
+    if prop_df is None:
+        st.warning(prop_note)
     else:
-        ev = odds_games[0]
-        eid = ev.get("id")
-        st.write(f"Probing: **{ev.get('away_team')} @ {ev.get('home_team')}**")
-        avail, am = fetch_event_market_keys(eid, regions="us")
-        if am.get("error"):
-            st.error(f"Availability check failed: {am['error']}")
-        batter_avail = [k for k in avail if k.startswith("batter_")]
-        st.write("Batter prop markets available:",
-                 ", ".join(batter_avail) if batter_avail else "none found")
-        if not batter_avail:
-            st.warning("No batter prop markets returned for this game/plan. Player props may "
-                       "not be in your tier, or may not be posted yet. Game-line edges are "
-                       "unaffected.")
+        if prop_meta.get("remaining"):
+            st.caption(f"Quota — used {prop_meta.get('used')}, "
+                       f"remaining {prop_meta.get('remaining')}")
+        if prop_note:
+            st.info(prop_note)
+        if prop_df.empty:
+            st.write("No green/amber prop edges found in the analysed games.")
         else:
-            event, em = fetch_event_props(eid, PROP_MARKETS, regions="us")
-            if em.get("error"):
-                st.error(em["error"])
-            elif not event:
-                st.warning("No prop odds returned.")
-            else:
-                if em.get("remaining"):
-                    st.caption(f"Quota — last call cost {em.get('last')}, "
-                               f"used {em.get('used')}, remaining {em.get('remaining')}")
-                bat = fetch_all_mlb_batting_stats(sel_date.year)
-                name_map = {str(n).lower(): row for n, row in
-                            zip(bat["name"], bat.to_dict("records"))}
-                rows = []
-                for mkey in [k for k in PROP_MARKETS.split(",") if k in batter_avail]:
-                    for player, od in consolidate_prop(event, mkey).items():
-                        srow = name_map.get(player.lower())
-                        if not srow:
-                            ln = player.lower().split()[-1] if player else ""
-                            srow = next((v for k, v in name_map.items()
-                                         if k.split()[-1] == ln), None)
-                        if not srow:
-                            continue
-                        lam = prop_expected_counts(srow, 4.2)   # neutral baseline (stage 1)
-                        mp = _p_over_line(lam[mkey], od["point"])
-                        bp, mode = market_prob(od["over"], od["under"])
-                        if mp is None or bp is None:
-                            continue
-                        edge = (mp - bp) * 100
-                        rows.append([_edge_light(edge), player, PROP_LABEL[mkey],
-                                     f"O{od['point']}", round(mp * 100, 1), round(bp * 100, 1),
-                                     round(edge, 1), od["over_best"], mode])
-                if not rows:
-                    st.warning("Got prop odds but couldn't match players to season stats.")
-                else:
-                    pdf = pd.DataFrame(rows, columns=["🚦", "Player", "Market", "Line",
-                                       "Model %", "Market %", "Edge", "Over odds", "Price"])
-                    pdf = pdf.sort_values("Edge", ascending=False).reset_index(drop=True)
-                    st.dataframe(pdf, use_container_width=True, hide_index=True,
-                        column_config={
-                            "🚦": st.column_config.TextColumn("", width="small"),
-                            "Model %": st.column_config.NumberColumn(format="%.1f"),
-                            "Market %": st.column_config.NumberColumn(format="%.1f"),
-                            "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f"),
-                            "Over odds": st.column_config.NumberColumn("Best over", format="%.2f"),
-                        })
-                    st.caption("Stage-1 probe uses a neutral pitcher/park baseline; the full "
-                               "build adds the opposing starter and ballpark per player and "
-                               "spans every game. Price = de-vig (both sides quoted) or raw "
-                               "(one-sided market, vig still included).")
+            ng = int((prop_df["Edge"] < 8).sum())
+            na = int((prop_df["Edge"] >= 8).sum())
+            st.markdown(f"### 🟢 {ng} green · 🟡 {na} amber value props")
+            pcfg = {
+                "Light": st.column_config.TextColumn("", width="small"),
+                "Player": st.column_config.TextColumn("Player", width="medium"),
+                "Game": st.column_config.TextColumn("Game", width="medium"),
+                "Model %": st.column_config.NumberColumn("Model %", format="%.1f"),
+                "Market %": st.column_config.NumberColumn("Market %", format="%.1f"),
+                "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f"),
+                "Best over": st.column_config.NumberColumn("Best over", format="%.2f"),
+                "Reason": st.column_config.TextColumn("Why it's green/amber", width="large"),
+            }
+
+            def show_prop_market(tab, label):
+                with tab:
+                    sub = prop_df[prop_df["Market"] == label].sort_values(
+                        "Edge", ascending=False).reset_index(drop=True)
+                    if sub.empty:
+                        st.write("No value bets in this market today.")
+                        return
+                    disp = sub[["Light", "Player", "Game", "Line", "Model %",
+                                "Market %", "Edge", "Best over", "Reason"]]
+                    st.dataframe(disp, use_container_width=True, hide_index=True,
+                                 column_config=pcfg)
+
+            hr_t, hit_t, rbi_t, run_t = st.tabs(
+                ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs"])
+            show_prop_market(hr_t, "Home Run")
+            show_prop_market(hit_t, "Hits")
+            show_prop_market(rbi_t, "RBI")
+            show_prop_market(run_t, "Runs")
+            st.caption("🟢 edge 2–8 · 🟡 8–15. Reds (15+) and no-signal (<2) are hidden. "
+                       "Model %: our probability · Market %: de-vigged book probability · "
+                       "Best over: best decimal price across US books. The model is still "
+                       "uncalibrated — paper-trade until it's backtested.")
 
 if load_btn:
     with st.status("Loading today's slate...", expanded=True) as status:
