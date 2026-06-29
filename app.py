@@ -259,6 +259,210 @@ def fetch_mlb_odds(regions: str = "us", markets: str = "h2h,spreads,totals",
     return data, meta
 
 
+import math, statistics
+
+LEAGUE_RPG_DEFAULT = 4.4    # league runs/game per team (fallback)
+LEAGUE_ERA_DEFAULT = 4.10   # league ERA (fallback)
+SP_WEIGHT = 0.60            # share of a game credited to the starting pitcher
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_team_offense(season: int):
+    """Team runs/game from the MLB Stats API. Returns (dict{team_id: rpg}, league_rpg)."""
+    data = safe_get("https://statsapi.mlb.com/api/v1/teams/stats", {
+        "stats": "season", "group": "hitting", "season": season, "sportIds": 1,
+    })
+    out = {}
+    splits = data.get("stats", [{}])[0].get("splits", []) if data.get("stats") else []
+    for sp in splits:
+        t = sp.get("team", {}); stat = sp.get("stat", {})
+        tid = int(t.get("id", 0) or 0)
+        g = float(stat.get("gamesPlayed") or 0); runs = float(stat.get("runs") or 0)
+        if tid and g > 0:
+            out[tid] = runs / g
+    league = (sum(out.values()) / len(out)) if out else LEAGUE_RPG_DEFAULT
+    return out, league
+
+
+def _pois_pmf(k, lam):
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+
+
+def _pois_vector(lam, max_runs=18):
+    v = [_pois_pmf(k, lam) for k in range(max_runs + 1)]
+    s = sum(v)
+    return [x / s for x in v] if s else v
+
+
+def expected_runs(team_rpg, opp_era, league_rpg, league_era, park=1.0):
+    off_idx = (team_rpg / league_rpg) if league_rpg > 0 else 1.0
+    blended_era = SP_WEIGHT * opp_era + (1 - SP_WEIGHT) * league_era
+    pitch_idx = (blended_era / league_era) if league_era > 0 else 1.0
+    return max(0.5, min(league_rpg * off_idx * pitch_idx * park, 12.0))
+
+
+def model_game(home_rpg, away_rpg, home_opp_era, away_opp_era,
+               league_rpg, league_era, total_line, park=1.0):
+    """home_opp_era = ERA of the pitcher the HOME team faces (the away starter)."""
+    lam_home = expected_runs(home_rpg, home_opp_era, league_rpg, league_era, park)
+    lam_away = expected_runs(away_rpg, away_opp_era, league_rpg, league_era, park)
+    ph = _pois_vector(lam_home); pa = _pois_vector(lam_away)
+    p_hw = p_aw = p_tie = p_hc = p_ac = 0.0
+    for h in range(len(ph)):
+        for a in range(len(pa)):
+            p = ph[h] * pa[a]
+            if h > a: p_hw += p
+            elif a > h: p_aw += p
+            else: p_tie += p
+            if h - a >= 2: p_hc += p
+            else: p_ac += p
+    lam_tot = lam_home + lam_away
+    pt = _pois_vector(lam_tot, max_runs=30)
+    p_over = p_under = p_push = 0.0
+    if total_line is not None:
+        line = float(total_line)
+        for t in range(len(pt)):
+            if t > line: p_over += pt[t]
+            elif t < line: p_under += pt[t]
+            else: p_push += pt[t]
+    return {"lam_home": lam_home, "lam_away": lam_away, "lam_total": lam_tot,
+            "p_home_ml": p_hw + p_tie / 2, "p_away_ml": p_aw + p_tie / 2,
+            "p_home_cover": p_hc, "p_away_cover": p_ac,
+            "p_over": p_over, "p_under": p_under, "p_push": p_push}
+
+
+def _median(xs):
+    xs = [x for x in xs if x]
+    return statistics.median(xs) if xs else None
+
+
+def consolidate_odds(game, home, away):
+    """Consensus (median) decimal odds + best available price per outcome."""
+    ml_home, ml_away, rl_home, rl_away = [], [], [], []
+    tot_by_line = {}
+    for bk in game.get("bookmakers", []):
+        for m in bk.get("markets", []):
+            key = m.get("key")
+            for o in m.get("outcomes", []):
+                name, price, point = o.get("name"), o.get("price"), o.get("point")
+                if key == "h2h":
+                    if name == home: ml_home.append(price)
+                    elif name == away: ml_away.append(price)
+                elif key == "spreads":
+                    if name == home: rl_home.append(price)
+                    elif name == away: rl_away.append(price)
+                elif key == "totals":
+                    if point is None: continue
+                    slot = tot_by_line.setdefault(point, {"over": [], "under": []})
+                    if name and name.lower() == "over": slot["over"].append(price)
+                    elif name and name.lower() == "under": slot["under"].append(price)
+    best_line, best_count = None, -1
+    for pt, d in tot_by_line.items():
+        c = min(len(d["over"]), len(d["under"]))
+        if c > best_count and c > 0:
+            best_count, best_line = c, pt
+    res = {"ml_home": _median(ml_home), "ml_away": _median(ml_away),
+           "ml_home_best": max(ml_home) if ml_home else None,
+           "ml_away_best": max(ml_away) if ml_away else None,
+           "rl_home": _median(rl_home), "rl_away": _median(rl_away),
+           "rl_home_best": max(rl_home) if rl_home else None,
+           "rl_away_best": max(rl_away) if rl_away else None,
+           "total_line": best_line, "over": None, "under": None,
+           "over_best": None, "under_best": None}
+    if best_line is not None:
+        d = tot_by_line[best_line]
+        res["over"], res["under"] = _median(d["over"]), _median(d["under"])
+        res["over_best"] = max(d["over"]) if d["over"] else None
+        res["under_best"] = max(d["under"]) if d["under"] else None
+    return res
+
+
+def devig_two(odds_a, odds_b):
+    if not odds_a or not odds_b: return None, None
+    ia, ib = 1 / odds_a, 1 / odds_b
+    s = ia + ib
+    return (ia / s, ib / s) if s > 0 else (None, None)
+
+
+def edge_ev(model_p, fair_p, best_odds):
+    edge = (model_p - fair_p) * 100 if (model_p is not None and fair_p is not None) else None
+    ev = (model_p * best_odds - 1) * 100 if (model_p is not None and best_odds) else None
+    return edge, ev
+
+
+def build_game_edges(sel_date):
+    """Match today's games to UK odds, run the model, return (df, note, meta)."""
+    sched = fetch_schedule(str(sel_date))
+    if sched.empty:
+        return None, "No games scheduled for this date.", {}
+    team_off, league_rpg = fetch_team_offense(sel_date.year)
+    odds_data, meta = fetch_mlb_odds(regions="uk")
+    if meta.get("error"):
+        return None, meta["error"], meta
+    if not odds_data:
+        return None, "No UK odds returned (markets may not be up yet).", meta
+
+    def norm(s): return (s or "").lower().strip()
+    odds_index = {(norm(g.get("home_team")), norm(g.get("away_team"))): g for g in odds_data}
+
+    rows, unmatched = [], []
+    for _, gm in sched.iterrows():
+        home, away = gm.get("home_team"), gm.get("away_team")
+        og = odds_index.get((norm(home), norm(away)))
+        if not og:
+            hk = norm(home).split()[-1] if norm(home).split() else ""
+            ak = norm(away).split()[-1] if norm(away).split() else ""
+            for (oh, oa), cand in odds_index.items():
+                if hk and ak and oh.endswith(hk) and oa.endswith(ak):
+                    og = cand; break
+        if not og:
+            unmatched.append(f"{away} @ {home}"); continue
+
+        home_rpg = team_off.get(int(gm.get("home_team_id") or 0), league_rpg)
+        away_rpg = team_off.get(int(gm.get("away_team_id") or 0), league_rpg)
+        away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
+        home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
+        cons = consolidate_odds(og, og.get("home_team"), og.get("away_team"))
+        mdl = model_game(home_rpg, away_rpg, away_sp.get("era", 4.5),
+                         home_sp.get("era", 4.5), league_rpg, LEAGUE_ERA_DEFAULT,
+                         cons.get("total_line"))
+        gl = f"{away} @ {home}"
+
+        fh, fa = devig_two(cons["ml_home"], cons["ml_away"])
+        if fh is not None:
+            e, v = edge_ev(mdl["p_home_ml"], fh, cons["ml_home_best"])
+            rows.append([gl, "Moneyline", home, mdl["p_home_ml"], fh, e, cons["ml_home_best"], v])
+            e, v = edge_ev(mdl["p_away_ml"], fa, cons["ml_away_best"])
+            rows.append([gl, "Moneyline", away, mdl["p_away_ml"], fa, e, cons["ml_away_best"], v])
+        frh, fra = devig_two(cons["rl_home"], cons["rl_away"])
+        if frh is not None:
+            e, v = edge_ev(mdl["p_home_cover"], frh, cons["rl_home_best"])
+            rows.append([gl, "Run line", f"{home} -1.5", mdl["p_home_cover"], frh, e, cons["rl_home_best"], v])
+            e, v = edge_ev(mdl["p_away_cover"], fra, cons["rl_away_best"])
+            rows.append([gl, "Run line", f"{away} +1.5", mdl["p_away_cover"], fra, e, cons["rl_away_best"], v])
+        fo, fu = devig_two(cons["over"], cons["under"])
+        if fo is not None and cons["total_line"] is not None:
+            ln = cons["total_line"]
+            e, v = edge_ev(mdl["p_over"], fo, cons["over_best"])
+            rows.append([gl, "Total", f"Over {ln}", mdl["p_over"], fo, e, cons["over_best"], v])
+            e, v = edge_ev(mdl["p_under"], fu, cons["under_best"])
+            rows.append([gl, "Total", f"Under {ln}", mdl["p_under"], fu, e, cons["under_best"], v])
+
+    if not rows:
+        return None, "No matched games with usable odds.", meta
+    df = pd.DataFrame(rows, columns=["Game", "Market", "Selection",
+                                     "Model %", "Fair %", "Edge", "Odds", "EV %"])
+    df["Model %"] = (df["Model %"] * 100).round(1)
+    df["Fair %"] = (df["Fair %"] * 100).round(1)
+    df["Edge"] = df["Edge"].round(1)
+    df["EV %"] = df["EV %"].round(1)
+    df = df.sort_values("Edge", ascending=False).reset_index(drop=True)
+    note = (f"Couldn't match odds for: {', '.join(unmatched)}" if unmatched else "")
+    return df, note, meta
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_pitcher_stats(pitcher_id):
     if not pitcher_id or pd.isna(pitcher_id):
@@ -477,6 +681,45 @@ with st.expander("🔌 Odds API connection test (The Odds API)"):
                 st.write(f"Sample game: {g.get('away_team')} @ {g.get('home_team')}  "
                          f"(start {g.get('commence_time')})")
                 st.json((g.get("bookmakers") or [{}])[0])
+
+st.divider()
+st.markdown("## 🎯 Game Bets — Money Line · Run Line · Totals")
+st.caption("Estimates each team's runs with a Poisson model (starting pitchers + team "
+           "offence), then compares to de-vigged UK odds to surface edges. Positive edge = "
+           "model rates the bet better than the market price. Always confirm the live price "
+           "at your book before staking — lines move.")
+gb_min = st.slider("Minimum edge to flag as a value bet (percentage points)",
+                   0.0, 15.0, 2.0, 0.5)
+if st.button("Analyse game bets (UK odds)"):
+    with st.spinner("Fetching schedule, team stats, pitchers and UK odds..."):
+        gdf, gnote, gmeta = build_game_edges(sel_date)
+    if gdf is None:
+        st.warning(gnote)
+    else:
+        if gmeta.get("remaining"):
+            st.caption(f"Odds quota — used {gmeta.get('used')}, "
+                       f"remaining {gmeta.get('remaining')}")
+        if gnote:
+            st.info(gnote)
+        value = gdf[gdf["Edge"] >= gb_min]
+        st.markdown(f"### \u2705 Value bets (edge \u2265 {gb_min} pts): {len(value)}")
+        cfg = {
+            "Model %": st.column_config.NumberColumn("Model %", format="%.1f"),
+            "Fair %": st.column_config.NumberColumn("Fair %", format="%.1f"),
+            "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f"),
+            "Odds": st.column_config.NumberColumn("Best odds", format="%.2f"),
+            "EV %": st.column_config.NumberColumn("EV %", format="%.1f"),
+            "Selection": st.column_config.TextColumn("Selection", width="medium"),
+            "Game": st.column_config.TextColumn("Game", width="medium"),
+        }
+        if not value.empty:
+            st.dataframe(value, use_container_width=True, hide_index=True, column_config=cfg)
+        else:
+            st.write("No bets clear your edge threshold today.")
+        with st.expander("Show all markets (full breakdown)"):
+            st.dataframe(gdf, use_container_width=True, hide_index=True, column_config=cfg)
+        st.caption("Model %: our probability. Fair %: book's de-vigged probability. "
+                   "Edge: model minus fair. EV %: expected return per unit stake at best odds.")
 
 if load_btn:
     with st.status("Loading today's slate...", expanded=True) as status:
