@@ -693,15 +693,18 @@ if "auto_df" in st.session_state:
                 c_chart, c_cards = st.columns([3,2])
                 with c_chart:
                     fig = go.Figure(go.Bar(
-                        y=sub.head(12)["Batter"]+" | "+sub.head(12)["Game"],
+                        y=sub.head(12)["Batter"],
                         x=sub.head(12)["Best Score"], orientation="h",
                         marker_color=MARKET_COLORS[market],
                         text=["ERA "+str(e) for e in sub.head(12)["Pitcher ERA"]],
                         textposition="inside", insidetextanchor="start",
                         textfont=dict(color="white",size=11),
+                        customdata=sub.head(12)["Game"],
+                        hovertemplate="%{y}<br>%{customdata}<br>Score: %{x:.1f}<extra></extra>",
                     ))
                     fig.update_layout(title="Top "+market+" Picks",
-                        yaxis=dict(autorange="reversed"), height=460,
+                        yaxis=dict(autorange="reversed", automargin=True, tickfont=dict(size=12)),
+                        height=460,
                         plot_bgcolor="#f9f8f5", paper_bgcolor="#f7f6f2",
                         margin=dict(l=10,r=10,t=40,b=20), font=dict(family="Inter"))
                     st.plotly_chart(fig, use_container_width=True)
