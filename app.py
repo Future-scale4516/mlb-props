@@ -329,6 +329,12 @@ PARK_FACTORS = {
 
 NEUTRAL_PARK = {"run": 1.0, "hr": 1.0}
 
+TEAM_ABBR = {108: "LAA", 109: "ARI", 110: "BAL", 111: "BOS", 112: "CHC", 113: "CIN",
+             114: "CLE", 115: "COL", 116: "DET", 117: "HOU", 118: "KC", 119: "LAD",
+             120: "WSH", 121: "NYM", 133: "ATH", 134: "PIT", 135: "SD", 136: "SEA",
+             137: "SF", 138: "STL", 139: "TB", 140: "TEX", 141: "TOR", 142: "MIN",
+             143: "PHI", 144: "ATL", 145: "CWS", 146: "MIA", 147: "NYY", 158: "MIL"}
+
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_team_offense(season: int):
@@ -365,6 +371,14 @@ def expected_runs(team_rpg, opp_era, league_rpg, league_era, park=1.0):
     blended_era = SP_WEIGHT * opp_era + (1 - SP_WEIGHT) * league_era
     pitch_idx = (blended_era / league_era) if league_era > 0 else 1.0
     return max(0.5, min(league_rpg * off_idx * pitch_idx * park, 12.0))
+
+
+def _park_neutral_rpg(rpg, own_park_run):
+    """Remove a team's own home-park effect from its season runs/game (~half of a
+    team's games are at its own park), so the game's park factor can be applied once
+    without double-counting the home team's park."""
+    blend = (own_park_run + 1.0) / 2.0
+    return rpg / blend if blend else rpg
 
 
 def model_game(home_rpg, away_rpg, home_opp_era, away_opp_era,
@@ -509,16 +523,19 @@ def build_game_edges(sel_date):
         if not og:
             unmatched.append(f"{away} @ {home}"); continue
 
-        home_rpg = team_off.get(int(gm.get("home_team_id") or 0), league_rpg)
-        away_rpg = team_off.get(int(gm.get("away_team_id") or 0), league_rpg)
+        hid = int(gm.get("home_team_id") or 0)
+        aid = int(gm.get("away_team_id") or 0)
+        pf = PARK_FACTORS.get(hid, NEUTRAL_PARK)
+        home_rpg = _park_neutral_rpg(team_off.get(hid, league_rpg), pf["run"])
+        away_rpg = _park_neutral_rpg(team_off.get(aid, league_rpg),
+                                     PARK_FACTORS.get(aid, NEUTRAL_PARK)["run"])
         away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
         home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
         cons = consolidate_odds(og, og.get("home_team"), og.get("away_team"))
-        pf = PARK_FACTORS.get(int(gm.get("home_team_id") or 0), NEUTRAL_PARK)
         mdl = model_game(home_rpg, away_rpg, away_sp.get("era", 4.5),
                          home_sp.get("era", 4.5), league_rpg, LEAGUE_ERA_DEFAULT,
                          cons.get("total_line"), park=pf["run"])
-        gl = f"{away} @ {home}"
+        gl = f"{TEAM_ABBR.get(aid, away)} @ {TEAM_ABBR.get(hid, home)}"
         ct = og.get("commence_time") or ""
         game_time[gl] = (ct, _commence_to_bst(ct))
 
@@ -747,7 +764,7 @@ def build_prop_edges(sel_date, max_games=6):
     PROP_MARKETS = "batter_home_runs,batter_hits,batter_rbis,batter_runs_scored"
     LABEL = {"batter_home_runs": "Home Run", "batter_hits": "Hits",
              "batter_rbis": "RBI", "batter_runs_scored": "Runs"}
-    cols = ["Market", "Light", "Player", "Game", "Line",
+    cols = ["Market", "Light", "Player", "Game", "Start", "Line",
             "Model %", "Market %", "Edge", "Best over", "Reason"]
     rows, unmatched = [], []
     analysed, last_meta = 0, meta
@@ -789,7 +806,8 @@ def build_prop_edges(sel_date, max_games=6):
         except Exception:
             pass
 
-        gl = f"{away} @ {home}"
+        gl = f"{TEAM_ABBR.get(away_id, away)} @ {TEAM_ABBR.get(home_id, home)}"
+        start = _commence_to_bst(ev.get("commence_time") or "")
         for mkey in PROP_MARKETS.split(","):
             for player, od in consolidate_prop(event, mkey).items():
                 srow = name_map.get(player.lower())
@@ -818,7 +836,7 @@ def build_prop_edges(sel_date, max_games=6):
                 edge = (mp - bp) * 100
                 if not (2.0 <= edge < 15.0):
                     continue
-                rows.append([LABEL[mkey], _edge_light(edge), player, gl, f"O{od['point']}",
+                rows.append([LABEL[mkey], _edge_light(edge), player, gl, start, f"O{od['point']}",
                              round(mp * 100, 1), round(bp * 100, 1), round(edge, 1),
                              od["over_best"], _prop_reason(mkey, srow, opp_hr9, opp_k9, park, order)])
 
@@ -826,6 +844,64 @@ def build_prop_edges(sel_date, max_games=6):
     if unmatched:
         note += f" Couldn't match: {', '.join(unmatched[:4])}."
     return pd.DataFrame(rows, columns=cols), last_meta, note
+
+
+def build_most_likely(sel_date, max_games=15):
+    """Rank batters by the model's raw probability of recording >=1 of each prop
+    market (no odds, no quota), using confirmed lineups, opposing starter and park."""
+    sched = fetch_schedule(str(sel_date))
+    if sched.empty:
+        return None, "No games scheduled for this date."
+    bat = fetch_all_mlb_batting_stats(sel_date.year)
+    if bat.empty:
+        return None, "No batter stats available."
+    stat_by_id = {int(r["player_id"]): r for r in bat.to_dict("records") if r.get("player_id")}
+    LABEL = {"batter_home_runs": "Home Run", "batter_hits": "Hits",
+             "batter_rbis": "RBI", "batter_runs_scored": "Runs"}
+    rows, n, no_lineups = [], 0, 0
+    for _, gm in sched.iterrows():
+        if n >= max_games:
+            break
+        hid = int(gm.get("home_team_id") or 0)
+        aid = int(gm.get("away_team_id") or 0)
+        park = PARK_FACTORS.get(hid, NEUTRAL_PARK)
+        away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
+        home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
+        try:
+            lu = fetch_live_lineups(int(gm.get("gamePk")))
+        except Exception:
+            lu = {}
+        gl = f"{TEAM_ABBR.get(aid, gm.get('away_team'))} @ {TEAM_ABBR.get(hid, gm.get('home_team'))}"
+        start = gm.get("game_time_bst", "")
+        had = False
+        for side, opp_sp in (("home", away_sp), ("away", home_sp)):
+            d = lu.get(side)
+            if d is None or d.empty:
+                continue
+            had = True
+            opp_hr9 = float(opp_sp.get("homeRunsPer9", LG_HR9) or LG_HR9)
+            opp_k9 = float(opp_sp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
+            for _, pr in d.iterrows():
+                srow = stat_by_id.get(int(pr["player_id"]))
+                if not srow:
+                    continue
+                order = int(pr.get("order", 5) or 5)
+                lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9,
+                                           park["hr"], park["run"])
+                for mkey, lbl in LABEL.items():
+                    p = _p_over_line(lam[mkey], 0.5)
+                    rows.append([lbl, pr.get("name") or srow.get("name"), gl, start,
+                                 int(order), round(p * 100, 1)])
+        if not had:
+            no_lineups += 1
+        n += 1
+    if not rows:
+        return None, "No confirmed lineups posted yet for these games (try closer to first pitch)."
+    df = pd.DataFrame(rows, columns=["Market", "Player", "Game", "Start", "Order", "Prob %"])
+    note = f"Ranked batters across {n - no_lineups} game(s) with confirmed lineups."
+    if no_lineups:
+        note += f" {no_lineups} game(s) had no lineup posted yet."
+    return df, note
 
 
 def _calib(recs, market):
@@ -863,9 +939,10 @@ def run_backtest(sel_date, days_back=14):
         for r in results:
             hid = int(r.get("home_team_id") or 0)
             aid = int(r.get("away_team_id") or 0)
-            home_rpg = team_off.get(hid, league_rpg)
-            away_rpg = team_off.get(aid, league_rpg)
             park = PARK_FACTORS.get(hid, NEUTRAL_PARK)
+            home_rpg = _park_neutral_rpg(team_off.get(hid, league_rpg), park["run"])
+            away_rpg = _park_neutral_rpg(team_off.get(aid, league_rpg),
+                                         PARK_FACTORS.get(aid, NEUTRAL_PARK)["run"])
             away_sp = fetch_pitcher_stats(r.get("away_prob_id")) if r.get("away_prob_id") else {"era": 4.5}
             home_sp = fetch_pitcher_stats(r.get("home_prob_id")) if r.get("home_prob_id") else {"era": 4.5}
             mdl = model_game(home_rpg, away_rpg, away_sp.get("era", 4.5),
@@ -1073,7 +1150,7 @@ with col_btn:
     load_btn = st.button("Load Today's Slate")
 with col_info:
     st.markdown("""
-    **Auto-loads:** MLB schedule · probable pitchers · **all 500+ batters** (MLB Stats API) · Fangraphs advanced stats (if available) · confirmed lineups · live ballpark weather
+    **Auto-loads:** MLB schedule · probable pitchers · **all 500+ batters** (MLB Stats API) · Savant advanced stats (if available) · confirmed lineups · live ballpark weather
     """)
 
 with st.expander("🔌 Odds API connection test (The Odds API)"):
@@ -1129,8 +1206,8 @@ if st.button("Analyse game bets (UK odds)"):
         cfg = {
             "🚦": st.column_config.TextColumn("", width="small"),
             "Start": st.column_config.TextColumn("Start (BST)", width="small"),
-            "Game": st.column_config.TextColumn("Game", width="medium"),
-            "Selection": st.column_config.TextColumn("Selection", width="medium"),
+            "Game": st.column_config.TextColumn("Game", width="small"),
+            "Selection": st.column_config.TextColumn("Selection", width="large"),
             "Model %": st.column_config.NumberColumn("Model %", format="%.1f"),
             "Fair %": st.column_config.NumberColumn("Fair %", format="%.1f"),
             "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f"),
@@ -1245,8 +1322,9 @@ if st.button("Find player prop edges (US books)"):
             st.markdown(f"### 🟢 {ng} green · 🟡 {na} amber value props")
             pcfg = {
                 "Light": st.column_config.TextColumn("", width="small"),
-                "Player": st.column_config.TextColumn("Player", width="medium"),
-                "Game": st.column_config.TextColumn("Game", width="medium"),
+                "Player": st.column_config.TextColumn("Player", width="large"),
+                "Game": st.column_config.TextColumn("Game", width="small"),
+                "Start": st.column_config.TextColumn("Start", width="small"),
                 "Model %": st.column_config.NumberColumn("Model %", format="%.1f"),
                 "Market %": st.column_config.NumberColumn("Market %", format="%.1f"),
                 "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f"),
@@ -1261,7 +1339,7 @@ if st.button("Find player prop edges (US books)"):
                     if sub.empty:
                         st.write("No value bets in this market today.")
                         return
-                    disp = sub[["Light", "Player", "Game", "Line", "Model %",
+                    disp = sub[["Light", "Player", "Game", "Start", "Line", "Model %",
                                 "Market %", "Edge", "Best over", "Reason"]]
                     st.dataframe(disp, use_container_width=True, hide_index=True,
                                  column_config=pcfg)
@@ -1276,6 +1354,48 @@ if st.button("Find player prop edges (US books)"):
                        "Model %: our probability · Market %: de-vigged book probability · "
                        "Best over: best decimal price across US books. The model is still "
                        "uncalibrated — paper-trade until it's backtested.")
+
+st.divider()
+st.markdown("## 🔮 Most Likely — best hitters to achieve a market")
+st.caption("Ranks batters by the model's raw probability of recording at least one "
+           "HR / hit / RBI / run, using confirmed lineups, the opposing starter and the "
+           "ballpark. This is the 'most likely' lens (ignores odds) — pair it with Player "
+           "Prop Edges, the 'best value' lens. Free — no odds or quota used.")
+if st.button("Rank most likely hitters"):
+    with st.spinner("Reading lineups, starters and parks..."):
+        ml_df, ml_note = build_most_likely(sel_date)
+    if ml_df is None:
+        st.warning(ml_note)
+    else:
+        st.caption(ml_note)
+        mlcfg = {
+            "Player": st.column_config.TextColumn("Player", width="large"),
+            "Game": st.column_config.TextColumn("Game", width="small"),
+            "Start": st.column_config.TextColumn("Start", width="small"),
+            "Order": st.column_config.NumberColumn("Slot", format="%d"),
+            "Prob %": st.column_config.ProgressColumn("Model prob %", min_value=0,
+                                                      max_value=100, format="%.1f"),
+        }
+
+        def show_ml(tab, label):
+            with tab:
+                sub = ml_df[ml_df["Market"] == label].sort_values(
+                    "Prob %", ascending=False).reset_index(drop=True)
+                if sub.empty:
+                    st.write("No ranked batters for this market.")
+                    return
+                st.dataframe(sub[["Player", "Game", "Start", "Order", "Prob %"]].head(40),
+                             use_container_width=True, hide_index=True, column_config=mlcfg)
+
+        ml_hr, ml_hit, ml_rbi, ml_run = st.tabs(
+            ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs"])
+        show_ml(ml_hr, "Home Run")
+        show_ml(ml_hit, "Hits")
+        show_ml(ml_rbi, "RBI")
+        show_ml(ml_run, "Runs")
+        st.caption("Most likely is not the same as best bet: a player can be very likely yet "
+                   "fairly priced (no value). Cross-reference with Player Prop Edges. Model "
+                   "is uncalibrated until backtested.")
 
 st.divider()
 st.markdown("## 📊 Model Backtest — calibration")
@@ -1497,7 +1617,7 @@ if load_btn:
                         "OBP":           round(obp_v,3),
                         "ISO":           round(iso_v,3),
                         "wRC+":          wrc_plus,
-                        "Stats Source":  "Fangraphs" if use_adv else "MLB API",
+                        "Stats Source":  "Savant" if use_adv else "MLB API",
                         "Opp Pitcher":   opp_pitch.get("name","TBD"),
                         "Pitcher Rating": p_rating,
                         "Pitcher ERA":   opp_pitch.get("era",4.5),
@@ -1534,7 +1654,7 @@ if "auto_df" in st.session_state:
         st.info("No results. Adjust filters and reload.")
     else:
         top = df.iloc[0]
-        fg_c  = len(df[df["Stats Source"]=="Fangraphs"])
+        fg_c  = len(df[df["Stats Source"]=="Savant"])
         mlb_c = len(df[df["Stats Source"]=="MLB API"])
         conf_c= len(df[df["Lineup Status"]=="Confirmed"])
 
@@ -1545,7 +1665,7 @@ if "auto_df" in st.session_state:
                 st.markdown(f'<div class="metric-card"><div class="metric-value">{val}</div>'
                             f'<div class="metric-label">{lbl}</div></div>', unsafe_allow_html=True)
 
-        st.info(f"Fangraphs: {fg_c} batters  |  MLB API: {mlb_c} batters  |  Confirmed lineups: {conf_c} batters")
+        st.info(f"Savant: {fg_c} batters  |  MLB API: {mlb_c} batters  |  Confirmed lineups: {conf_c} batters")
 
         SHOW = ["Game","Game Time BST","Batter","Order","AVG","OBP","ISO","wRC+","Env Rating", "Pitcher Rating", "Grade"]
 
@@ -1712,4 +1832,4 @@ if "auto_df" in st.session_state:
             file_name=f"mlb_props_{sel_date}.csv", mime="text/csv")
 
 st.divider()
-st.caption("MLB Stats API (all batters via playerPool=ALL) · Fangraphs via pybaseball (optional enrichment) · Open-Meteo weather")
+st.caption("MLB Stats API (all batters via playerPool=ALL) · Baseball Savant via pybaseball (optional enrichment) · Open-Meteo weather")
