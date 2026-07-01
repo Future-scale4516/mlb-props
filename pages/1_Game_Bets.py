@@ -53,8 +53,15 @@ if st.button("Analyse game bets (UK odds)"):
                     return
                 sub = sub.copy()
                 sub.insert(0, "🚦", sub["Edge"].apply(_edge_light))
-                disp = sub[["🚦", "Start", "US Date", "Game", "Selection",
-                            "Model %", "Fair %", "Edge", "Odds", "EV %"]]
+                
+                # The ideal list of columns you want to display
+                target_cols = ["🚦", "Start", "US Date", "Game", "Selection",
+                               "Model %", "Fair %", "Edge", "Odds", "EV %"]
+                
+                # Filter out any columns that don't exist in the current dataframe
+                display_cols = [col for col in target_cols if col in sub.columns]
+                
+                disp = sub[display_cols]
                 st.dataframe(disp, use_container_width=True, hide_index=True,
                              column_config=cfg)
 
