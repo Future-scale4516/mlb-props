@@ -599,6 +599,7 @@ def build_game_edges(sel_date):
 
 LG_HR9 = 1.15   # league avg HR allowed per 9 innings
 LG_K9 = 8.5     # league avg K per 9 innings
+LG_WHIP = 1.30  # league avg walks+hits per inning pitched
 
 
 def _p_over_line(expected_count, point):
@@ -618,17 +619,22 @@ def expected_pa(order):
         return 4.1
 
 
-def prop_expected_counts(stat, pa, opp_hr9=LG_HR9, opp_k9=LG_K9, park_hr=1.0, park_run=1.0):
+def prop_expected_counts(stat, pa, opp_hr9=LG_HR9, opp_k9=LG_K9, opp_whip=LG_WHIP,
+                          park_hr=1.0, park_run=1.0):
     """Expected per-game counts (Poisson lambdas) for each batter prop market.
-    Season rate carries the hitter's talent; pitcher + park are the adjustments."""
+    Season rate carries the hitter's talent; pitcher + park are the adjustments.
+    HR uses the opposing starter's HR9, Hits uses their K9, and RBI/Runs use their
+    WHIP (baserunners allowed) since driving in or scoring runs depends more on
+    traffic on the bases than on any single pitcher-batter matchup stat."""
     spa = max(stat.get("plateAppearances", 1) or 1, 1)
     hr_l = (stat.get("hr", 0) / spa) * (opp_hr9 / LG_HR9) * park_hr * pa
     hits = stat.get("hits")
     hit_rate = (hits / spa) if hits is not None else stat.get("avg", 0) * 0.88
     k_factor = 1.0 - 0.5 * min(max((opp_k9 - LG_K9) / LG_K9, -0.3), 0.3)
     hit_l = hit_rate * k_factor * (1.0 + 0.5 * (park_run - 1.0)) * pa
-    rbi_l = (stat.get("rbi", 0) / spa) * (0.6 + 0.4 * park_run) * pa
-    run_l = (stat.get("runs", 0) / spa) * (0.6 + 0.4 * park_run) * pa
+    whip_factor = 1.0 + 0.5 * min(max((opp_whip - LG_WHIP) / LG_WHIP, -0.3), 0.3)
+    rbi_l = (stat.get("rbi", 0) / spa) * (0.6 + 0.4 * park_run) * whip_factor * pa
+    run_l = (stat.get("runs", 0) / spa) * (0.6 + 0.4 * park_run) * whip_factor * pa
     return {"batter_home_runs": hr_l, "batter_hits": hit_l,
             "batter_rbis": rbi_l, "batter_runs_scored": run_l}
 
@@ -846,11 +852,12 @@ def build_prop_edges(sel_date, max_games=6):
                 elif tid == away_id:
                     opp = home_sp
                 else:
-                    opp = {"homeRunsPer9": LG_HR9, "strikeoutsPer9Inn": LG_K9}
+                    opp = {"homeRunsPer9": LG_HR9, "strikeoutsPer9Inn": LG_K9, "whip": LG_WHIP}
                 opp_hr9 = float(opp.get("homeRunsPer9", LG_HR9) or LG_HR9)
                 opp_k9 = float(opp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
+                opp_whip = float(opp.get("whip", LG_WHIP) or LG_WHIP)
                 order = order_map.get(pid, 5)
-                lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9,
+                lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9, opp_whip,
                                            park["hr"], park["run"])
                 mp = _p_over_line(lam[mkey], od["point"])
                 bp, mode = market_prob(od["over"], od["under"])
@@ -904,12 +911,13 @@ def build_most_likely(sel_date, max_games=15):
             had = True
             opp_hr9 = float(opp_sp.get("homeRunsPer9", LG_HR9) or LG_HR9)
             opp_k9 = float(opp_sp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
+            opp_whip = float(opp_sp.get("whip", LG_WHIP) or LG_WHIP)
             for _, pr in d.iterrows():
                 srow = stat_by_id.get(int(pr["player_id"]))
                 if not srow:
                     continue
                 order = int(pr.get("order", 5) or 5)
-                lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9,
+                lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9, opp_whip,
                                            park["hr"], park["run"])
                 for mkey, lbl in LABEL.items():
                     p = _p_over_line(lam[mkey], 0.5)
@@ -1059,7 +1067,8 @@ def run_prop_backtest(sel_date, days_back=14, max_games_per_day=None):
                 opp_sp = away_sp if b["team_id"] == hid else home_sp
                 opp_hr9 = float(opp_sp.get("homeRunsPer9", LG_HR9) or LG_HR9)
                 opp_k9 = float(opp_sp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
-                lam = prop_expected_counts(srow, expected_pa(b["order"]), opp_hr9, opp_k9,
+                opp_whip = float(opp_sp.get("whip", LG_WHIP) or LG_WHIP)
+                lam = prop_expected_counts(srow, expected_pa(b["order"]), opp_hr9, opp_k9, opp_whip,
                                            park["hr"], park["run"])
                 probs = {}
                 for mkey, label in LABEL.items():
