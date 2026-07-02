@@ -112,6 +112,7 @@ def fetch_results(target_date: str):
             if hs is None or as_ is None:
                 continue
             out.append({
+                "gamePk": g.get("gamePk"),
                 "home_team_id": t.get("home", {}).get("team", {}).get("id"),
                 "away_team_id": t.get("away", {}).get("team", {}).get("id"),
                 "home_prob_id": t.get("home", {}).get("probablePitcher", {}).get("id"),
@@ -976,6 +977,105 @@ def run_backtest(sel_date, days_back=14):
             recs.append(("Total Over 8.5", mdl["p_over"], 1 if total > 8.5 else 0))
             recs.append(("Run line (home -1.5)", mdl["p_home_cover"], 1 if margin >= 2 else 0))
     return recs, days_done
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_boxscore_batters(game_pk):
+    """Actual batter box-score lines (hits, HR, RBI, runs, batting order) for a
+    completed game. Free MLB data, used to score the prop model in the backtest."""
+    if not game_pk:
+        return []
+    data = safe_get(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore")
+    out = []
+    for side in ("home", "away"):
+        team = data.get("teams", {}).get(side, {})
+        team_id = team.get("team", {}).get("id")
+        for pid, p in team.get("players", {}).items():
+            bo = p.get("battingOrder")
+            bat = p.get("stats", {}).get("batting", {})
+            if not bo or not bat or bat.get("plateAppearances", 0) in (0, None):
+                continue
+            try:
+                order = int(bo) // 100
+            except Exception:
+                continue
+            if order < 1 or order > 9:
+                continue
+            out.append({
+                "player_id": p.get("person", {}).get("id"),
+                "name": p.get("person", {}).get("fullName", ""),
+                "team_id": team_id,
+                "order": order,
+                "hits": int(bat.get("hits") or 0),
+                "hr": int(bat.get("homeRuns") or 0),
+                "rbi": int(bat.get("rbi") or 0),
+                "runs": int(bat.get("runs") or 0),
+            })
+    return out
+
+
+def run_prop_backtest(sel_date, days_back=14, max_games_per_day=None):
+    """Score the player-prop model against real box scores from recent completed
+    games. Uses each batter's actual starting slot (so plate-appearance estimates
+    match what actually happened) and the real opposing starter + park for that
+    game. Adds a 'Runs+Hits+RBI (1+)' combo market alongside the four singles.
+    Returns (records, days_done, games_scored)."""
+    bat = fetch_all_mlb_batting_stats(sel_date.year)
+    if bat.empty:
+        return [], 0, 0
+    stat_by_id = {int(r["player_id"]): r for r in bat.to_dict("records") if r.get("player_id")}
+
+    LABEL = {"batter_home_runs": "Home Run", "batter_hits": "Hits",
+             "batter_rbis": "RBI", "batter_runs_scored": "Runs"}
+    ACTUAL_KEY = {"batter_home_runs": "hr", "batter_hits": "hits",
+                  "batter_rbis": "rbi", "batter_runs_scored": "runs"}
+
+    recs, days_done, games_scored = [], 0, 0
+    for i in range(1, days_back + 1):
+        day = sel_date - timedelta(days=i)
+        results = fetch_results(str(day))
+        if not results:
+            continue
+        days_done += 1
+        if max_games_per_day:
+            results = results[:max_games_per_day]
+        for r in results:
+            gp = r.get("gamePk")
+            if not gp:
+                continue
+            box = fetch_boxscore_batters(gp)
+            if not box:
+                continue
+            games_scored += 1
+            hid = int(r.get("home_team_id") or 0)
+            aid = int(r.get("away_team_id") or 0)
+            park = PARK_FACTORS.get(hid, NEUTRAL_PARK)
+            away_sp = fetch_pitcher_stats(r.get("away_prob_id")) if r.get("away_prob_id") else {"era": 4.5}
+            home_sp = fetch_pitcher_stats(r.get("home_prob_id")) if r.get("home_prob_id") else {"era": 4.5}
+            for b in box:
+                srow = stat_by_id.get(int(b["player_id"] or 0))
+                if not srow:
+                    continue
+                opp_sp = away_sp if b["team_id"] == hid else home_sp
+                opp_hr9 = float(opp_sp.get("homeRunsPer9", LG_HR9) or LG_HR9)
+                opp_k9 = float(opp_sp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
+                lam = prop_expected_counts(srow, expected_pa(b["order"]), opp_hr9, opp_k9,
+                                           park["hr"], park["run"])
+                probs = {}
+                for mkey, label in LABEL.items():
+                    p = _p_over_line(lam[mkey], 0.5)
+                    if p is None:
+                        continue
+                    outcome = 1 if b[ACTUAL_KEY[mkey]] >= 1 else 0
+                    recs.append((label, p, outcome))
+                    probs[mkey] = p
+                if len(probs) == 4:
+                    p_combo = 1 - (1 - probs["batter_hits"]) * \
+                                  (1 - probs["batter_runs_scored"]) * \
+                                  (1 - probs["batter_rbis"])
+                    outcome_combo = 1 if (b["hits"] >= 1 or b["runs"] >= 1 or b["rbi"] >= 1) else 0
+                    recs.append(("Runs+Hits+RBI (1+)", min(p_combo, 0.999), outcome_combo))
+    return recs, days_done, games_scored
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
