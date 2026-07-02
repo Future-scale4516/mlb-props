@@ -600,6 +600,8 @@ def build_game_edges(sel_date):
 LG_HR9 = 1.15   # league avg HR allowed per 9 innings
 LG_K9 = 8.5     # league avg K per 9 innings
 LG_WHIP = 1.30  # league avg walks+hits per inning pitched
+LG_OBP_DEFAULT = 0.320  # league avg on-base %, used for "table setters ahead" context
+LG_SLG_DEFAULT = 0.400  # league avg slugging, used for "run producers behind" context
 
 
 def _p_over_line(expected_count, point):
@@ -619,22 +621,69 @@ def expected_pa(order):
         return 4.1
 
 
+def _lineup_context(order, slot_to_pid, stat_by_id):
+    """Estimate the lineup context around a batter: the on-base ability of the
+    table-setters hitting AHEAD of him (drives his RBI chances — someone has to be
+    on base for him to drive in) and the power of the hitters BEHIND him (drives his
+    run-scoring chances — someone has to drive him in once he's on). Uses the 3
+    nearest hitters in each direction, weighted toward the closest slot, and wraps
+    around the 9-spot order. Falls back to league averages when lineup data is
+    missing, so this degrades gracefully rather than failing."""
+    if not slot_to_pid:
+        return LG_OBP_DEFAULT, LG_SLG_DEFAULT
+    weights = [0.5, 0.3, 0.2]
+
+    def slot(o):
+        return ((o - 1) % 9) + 1
+
+    ahead_vals, ahead_w = [], []
+    for i, w in enumerate(weights, start=1):
+        pid = slot_to_pid.get(slot(order - i))
+        srow = stat_by_id.get(pid) if pid else None
+        if srow:
+            ahead_vals.append(srow.get("obp") or LG_OBP_DEFAULT)
+            ahead_w.append(w)
+    ahead_obp = (sum(v * w for v, w in zip(ahead_vals, ahead_w)) / sum(ahead_w)
+                 if ahead_w else LG_OBP_DEFAULT)
+
+    behind_vals, behind_w = [], []
+    for i, w in enumerate(weights, start=1):
+        pid = slot_to_pid.get(slot(order + i))
+        srow = stat_by_id.get(pid) if pid else None
+        if srow:
+            behind_vals.append(srow.get("slg") or LG_SLG_DEFAULT)
+            behind_w.append(w)
+    behind_slg = (sum(v * w for v, w in zip(behind_vals, behind_w)) / sum(behind_w)
+                  if behind_w else LG_SLG_DEFAULT)
+
+    return ahead_obp, behind_slg
+
+
 def prop_expected_counts(stat, pa, opp_hr9=LG_HR9, opp_k9=LG_K9, opp_whip=LG_WHIP,
+                          ahead_obp=LG_OBP_DEFAULT, behind_slg=LG_SLG_DEFAULT,
                           park_hr=1.0, park_run=1.0):
     """Expected per-game counts (Poisson lambdas) for each batter prop market.
-    Season rate carries the hitter's talent; pitcher + park are the adjustments.
-    HR uses the opposing starter's HR9, Hits uses their K9, and RBI/Runs use their
-    WHIP (baserunners allowed) since driving in or scoring runs depends more on
-    traffic on the bases than on any single pitcher-batter matchup stat."""
+    Season rate carries the hitter's talent; pitcher + park + lineup are the
+    adjustments. HR uses the opposing starter's HR9, Hits uses their K9. RBI uses
+    the pitcher's WHIP (baserunners allowed) AND the OBP of the batters hitting
+    ahead of him (real traffic on base for him to drive in — the pitcher's WHIP
+    alone doesn't say whether THIS batter's teammates are the ones reaching).
+    Runs uses WHIP plus the SLG of the batters hitting behind him (someone has to
+    drive him in once he's on base)."""
     spa = max(stat.get("plateAppearances", 1) or 1, 1)
     hr_l = (stat.get("hr", 0) / spa) * (opp_hr9 / LG_HR9) * park_hr * pa
     hits = stat.get("hits")
     hit_rate = (hits / spa) if hits is not None else stat.get("avg", 0) * 0.88
     k_factor = 1.0 - 0.5 * min(max((opp_k9 - LG_K9) / LG_K9, -0.3), 0.3)
     hit_l = hit_rate * k_factor * (1.0 + 0.5 * (park_run - 1.0)) * pa
+
     whip_factor = 1.0 + 0.5 * min(max((opp_whip - LG_WHIP) / LG_WHIP, -0.3), 0.3)
-    rbi_l = (stat.get("rbi", 0) / spa) * (0.6 + 0.4 * park_run) * whip_factor * pa
-    run_l = (stat.get("runs", 0) / spa) * (0.6 + 0.4 * park_run) * whip_factor * pa
+    traffic_factor = 1.0 + 0.6 * min(max((ahead_obp - LG_OBP_DEFAULT) / LG_OBP_DEFAULT, -0.4), 0.4)
+    rbi_l = (stat.get("rbi", 0) / spa) * (0.6 + 0.4 * park_run) * whip_factor * traffic_factor * pa
+
+    support_factor = 1.0 + 0.5 * min(max((behind_slg - LG_SLG_DEFAULT) / LG_SLG_DEFAULT, -0.4), 0.4)
+    run_l = (stat.get("runs", 0) / spa) * (0.6 + 0.4 * park_run) * whip_factor * support_factor * pa
+
     return {"batter_home_runs": hr_l, "batter_hits": hit_l,
             "batter_rbis": rbi_l, "batter_runs_scored": run_l}
 
@@ -741,7 +790,8 @@ def fetch_event_market_keys(event_id, regions="us"):
     return sorted(keys), meta
 
 
-def _prop_reason(mkey, srow, opp_hr9, opp_k9, park, order):
+def _prop_reason(mkey, srow, opp_hr9, opp_k9, park, order, ahead_obp=LG_OBP_DEFAULT,
+                  behind_slg=LG_SLG_DEFAULT):
     """Short, honest explanation of what is pushing a prop edge into the green/amber."""
     spa = max(srow.get("plateAppearances", 1) or 1, 1)
     bits = []
@@ -759,10 +809,22 @@ def _prop_reason(mkey, srow, opp_hr9, opp_k9, park, order):
             bits.append(f"low-strikeout starter ({opp_k9:.1f} K/9)")
         if park["run"] >= 1.05:
             bits.append("hitter-friendly park")
-    else:  # rbi / runs
+    elif mkey == "batter_rbis":
+        if ahead_obp >= 0.345:
+            bits.append(f"good table-setters ahead (.{int(round(ahead_obp*1000)):03d} OBP)")
         if order and order <= 5:
             bits.append(f"bats #{order} (more chances)")
-        rate = (srow.get("rbi", 0) if mkey == "batter_rbis" else srow.get("runs", 0)) / spa
+        rate = srow.get("rbi", 0) / spa
+        if rate >= 0.13:
+            bits.append("high rate for this market")
+        if park["run"] >= 1.05:
+            bits.append("hitter-friendly park")
+    else:  # runs scored
+        if behind_slg >= 0.430:
+            bits.append(f"power hitters behind (.{int(round(behind_slg*1000)):03d} SLG)")
+        if order and order <= 5:
+            bits.append(f"bats #{order} (more chances)")
+        rate = srow.get("runs", 0) / spa
         if rate >= 0.13:
             bits.append("high rate for this market")
         if park["run"] >= 1.05:
@@ -785,6 +847,7 @@ def build_prop_edges(sel_date, max_games=6):
     if bat.empty:
         return None, meta, "No batter stats available."
     name_map = {str(n).lower(): row for n, row in zip(bat["name"], bat.to_dict("records"))}
+    stat_by_id = {int(r["player_id"]): r for r in bat.to_dict("records") if r.get("player_id")}
 
     def norm(s): return (s or "").lower().strip()
     sched_index = {(norm(gm.get("home_team")), norm(gm.get("away_team"))): gm
@@ -825,13 +888,16 @@ def build_prop_edges(sel_date, max_games=6):
         away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
         home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
         order_map = {}
+        lineup_by_team = {home_id: {}, away_id: {}}
         try:
             lu = fetch_live_lineups(int(gm.get("gamePk")))
             for side in ("home", "away"):
                 d = lu.get(side)
                 if d is not None and not d.empty and "order" in d.columns:
+                    tid = home_id if side == "home" else away_id
                     for _, r in d.iterrows():
                         order_map[int(r["player_id"])] = int(r["order"])
+                        lineup_by_team[tid][int(r["order"])] = int(r["player_id"])
         except Exception:
             pass
 
@@ -857,8 +923,10 @@ def build_prop_edges(sel_date, max_games=6):
                 opp_k9 = float(opp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
                 opp_whip = float(opp.get("whip", LG_WHIP) or LG_WHIP)
                 order = order_map.get(pid, 5)
+                ahead_obp, behind_slg = _lineup_context(
+                    order, lineup_by_team.get(tid, {}), stat_by_id)
                 lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9, opp_whip,
-                                           park["hr"], park["run"])
+                                           ahead_obp, behind_slg, park["hr"], park["run"])
                 mp = _p_over_line(lam[mkey], od["point"])
                 bp, mode = market_prob(od["over"], od["under"])
                 if mp is None or bp is None:
@@ -868,7 +936,8 @@ def build_prop_edges(sel_date, max_games=6):
                     continue
                 rows.append([LABEL[mkey], _edge_light(edge), player, gl, start, f"O{od['point']}",
                              round(mp * 100, 1), round(bp * 100, 1), round(edge, 1),
-                             od["over_best"], _prop_reason(mkey, srow, opp_hr9, opp_k9, park, order)])
+                             od["over_best"], _prop_reason(mkey, srow, opp_hr9, opp_k9, park,
+                                                            order, ahead_obp, behind_slg)])
 
     note = f"Analysed {analysed} game(s)."
     if unmatched:
@@ -912,13 +981,21 @@ def build_most_likely(sel_date, max_games=15):
             opp_hr9 = float(opp_sp.get("homeRunsPer9", LG_HR9) or LG_HR9)
             opp_k9 = float(opp_sp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
             opp_whip = float(opp_sp.get("whip", LG_WHIP) or LG_WHIP)
+            slot_to_pid = {}
+            if "order" in d.columns:
+                for _, r in d.iterrows():
+                    try:
+                        slot_to_pid[int(r["order"])] = int(r["player_id"])
+                    except Exception:
+                        pass
             for _, pr in d.iterrows():
                 srow = stat_by_id.get(int(pr["player_id"]))
                 if not srow:
                     continue
                 order = int(pr.get("order", 5) or 5)
+                ahead_obp, behind_slg = _lineup_context(order, slot_to_pid, stat_by_id)
                 lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9, opp_whip,
-                                           park["hr"], park["run"])
+                                           ahead_obp, behind_slg, park["hr"], park["run"])
                 for mkey, lbl in LABEL.items():
                     p = _p_over_line(lam[mkey], 0.5)
                     rows.append([lbl, pr.get("name") or srow.get("name"), gl, start,
@@ -1060,6 +1137,13 @@ def run_prop_backtest(sel_date, days_back=14, max_games_per_day=None):
             park = PARK_FACTORS.get(hid, NEUTRAL_PARK)
             away_sp = fetch_pitcher_stats(r.get("away_prob_id")) if r.get("away_prob_id") else {"era": 4.5}
             home_sp = fetch_pitcher_stats(r.get("home_prob_id")) if r.get("home_prob_id") else {"era": 4.5}
+            # Real batting order for both teams, straight from the box score — more
+            # accurate than a pre-game lineup guess since this is what actually happened.
+            slot_by_team = {hid: {}, aid: {}}
+            for b in box:
+                tid_b = b.get("team_id")
+                if tid_b in slot_by_team and b.get("order"):
+                    slot_by_team[tid_b][int(b["order"])] = b["player_id"]
             for b in box:
                 srow = stat_by_id.get(int(b["player_id"] or 0))
                 if not srow:
@@ -1068,8 +1152,10 @@ def run_prop_backtest(sel_date, days_back=14, max_games_per_day=None):
                 opp_hr9 = float(opp_sp.get("homeRunsPer9", LG_HR9) or LG_HR9)
                 opp_k9 = float(opp_sp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
                 opp_whip = float(opp_sp.get("whip", LG_WHIP) or LG_WHIP)
+                ahead_obp, behind_slg = _lineup_context(
+                    b["order"], slot_by_team.get(b["team_id"], {}), stat_by_id)
                 lam = prop_expected_counts(srow, expected_pa(b["order"]), opp_hr9, opp_k9, opp_whip,
-                                           park["hr"], park["run"])
+                                           ahead_obp, behind_slg, park["hr"], park["run"])
                 probs = {}
                 for mkey, label in LABEL.items():
                     p = _p_over_line(lam[mkey], 0.5)
