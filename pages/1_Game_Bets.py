@@ -53,22 +53,45 @@ if st.button("Analyse game bets (UK odds)"):
                     return
                 sub = sub.copy()
                 sub.insert(0, "🚦", sub["Edge"].apply(_edge_light))
-                
-                # The ideal list of columns you want to display
-                target_cols = ["🚦", "Start", "US Date", "Game", "Selection",
-                               "Model %", "Fair %", "Edge", "Odds", "EV %"]
-                
-                # Filter out any columns that don't exist in the current dataframe
-                display_cols = [col for col in target_cols if col in sub.columns]
-                
-                disp = sub[display_cols]
+                disp = sub[["🚦", "Start", "US Date", "Game", "Selection",
+                            "Model %", "Fair %", "Edge", "Odds", "EV %"]]
                 st.dataframe(disp, use_container_width=True, hide_index=True,
                              column_config=cfg)
 
-        ml_tab, rl_tab, tot_tab = st.tabs(["💰 Money Line", "📏 Run Line", "📊 Totals"])
+        def show_most_likely(tab):
+            with tab:
+                st.caption("Pure model confidence, ignoring the market entirely — this is "
+                           "'who/what does the model predict', not 'where's the value'. "
+                           "Ignore Fair %, Edge, and odds for this question; Model % alone "
+                           "answers it. A high % here is still not a guarantee — see the "
+                           "backtest for how often the model's confidence bands actually hit.")
+                mkt_pick = st.multiselect("Markets to include:",
+                                          ["Moneyline", "Run line", "Total"],
+                                          default=["Moneyline", "Run line", "Total"],
+                                          key="ml_market_pick")
+                sub = gdf[gdf["Market"].isin(mkt_pick)].sort_values(
+                    "Model %", ascending=False).reset_index(drop=True)
+                if sub.empty:
+                    st.write("No selections match the chosen markets.")
+                    return
+                disp = sub[["Start", "US Date", "Game", "Market", "Selection", "Model %"]]
+                st.dataframe(disp, use_container_width=True, hide_index=True,
+                             column_config={
+                                 "Start": st.column_config.TextColumn("Start (BST)", width="small"),
+                                 "US Date": st.column_config.TextColumn("US Date", width="small"),
+                                 "Game": st.column_config.TextColumn("Game", width="small"),
+                                 "Market": st.column_config.TextColumn("Market", width="small"),
+                                 "Selection": st.column_config.TextColumn("Selection", width="large"),
+                                 "Model %": st.column_config.ProgressColumn(
+                                     "Model %", min_value=0, max_value=100, format="%.1f"),
+                             })
+
+        ml_tab, rl_tab, tot_tab, most_likely_tab = st.tabs(
+            ["💰 Money Line", "📏 Run Line", "📊 Totals", "🎯 Most Likely"])
         show_market(ml_tab, "Moneyline")
         show_market(rl_tab, "Run line")
         show_market(tot_tab, "Total")
+        show_most_likely(most_likely_tab)
         st.caption("Model %: our probability · Fair %: book's de-vigged probability · "
                    "Edge: model minus fair · EV %: expected return per unit stake at best "
                    "odds. Heads-up: very large edges (15+ pts) usually mean the model is "
