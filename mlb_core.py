@@ -505,6 +505,50 @@ def _commence_to_et_str(iso):
     return d.strftime("%a %b %d") if d else ""
 
 
+def _ml_rl_reason(team_rpg, opp_rpg, team_era, opp_era,
+                   league_rpg=LEAGUE_RPG_DEFAULT, league_era=LEAGUE_ERA_DEFAULT):
+    """Short, honest explanation for a Moneyline/Run line pick, using the same
+    inputs the model actually used: park-neutral team offense and both starters'
+    ERA. Mirrors the style of _prop_reason."""
+    bits = []
+    if team_rpg - opp_rpg >= 0.5:
+        bits.append(f"stronger offense ({team_rpg:.1f} vs {opp_rpg:.1f} RPG)")
+    if team_era <= league_era - 0.4:
+        bits.append(f"quality starter (ERA {team_era:.2f})")
+    if opp_era >= league_era + 0.4:
+        bits.append(f"opposing starter has struggled (ERA {opp_era:.2f})")
+    if not bits:
+        return "Edge from market pricing, not a standout matchup"
+    joined = "; ".join(bits[:3])
+    return joined[:1].upper() + joined[1:]
+
+
+def _total_reason(home_rpg, away_rpg, home_era, away_era, park, side,
+                   league_rpg=LEAGUE_RPG_DEFAULT, league_era=LEAGUE_ERA_DEFAULT):
+    """Short, honest explanation for a Totals (Over/Under) pick."""
+    combined = home_rpg + away_rpg
+    league_combined = league_rpg * 2
+    bits = []
+    if side == "Over":
+        if combined - league_combined >= 0.8:
+            bits.append(f"both offenses hot ({combined:.1f} combined RPG)")
+        if home_era >= league_era + 0.4 or away_era >= league_era + 0.4:
+            bits.append("a shaky starter in this game")
+        if park.get("run", 1.0) >= 1.05:
+            bits.append("hitter-friendly park")
+    else:
+        if league_combined - combined >= 0.8:
+            bits.append(f"quiet bats on both sides ({combined:.1f} combined RPG)")
+        if home_era <= league_era - 0.4 and away_era <= league_era - 0.4:
+            bits.append("two quality starters")
+        if park.get("run", 1.0) <= 0.95:
+            bits.append("pitcher-friendly park")
+    if not bits:
+        return "Edge from market pricing, not a standout matchup"
+    joined = "; ".join(bits[:3])
+    return joined[:1].upper() + joined[1:]
+
+
 def build_game_edges(sel_date):
     """Match today's games to UK odds, run the model, return (df, note, meta)."""
     sched = fetch_schedule(str(sel_date))
@@ -561,30 +605,38 @@ def build_game_edges(sel_date):
         ct = og.get("commence_time") or ""
         game_time[gl] = (ct, _commence_to_bst(ct), _commence_to_et_str(ct))
 
+        home_era = home_sp.get("era", 4.5)
+        away_era = away_sp.get("era", 4.5)
         fh, fa = devig_two(cons["ml_home"], cons["ml_away"])
         if fh is not None:
             e, v = edge_ev(mdl["p_home_ml"], fh, cons["ml_home_best"])
-            rows.append([gl, "Moneyline", home, mdl["p_home_ml"], fh, e, cons["ml_home_best"], v])
+            rows.append([gl, "Moneyline", home, mdl["p_home_ml"], fh, e, cons["ml_home_best"], v,
+                         _ml_rl_reason(home_rpg, away_rpg, home_era, away_era)])
             e, v = edge_ev(mdl["p_away_ml"], fa, cons["ml_away_best"])
-            rows.append([gl, "Moneyline", away, mdl["p_away_ml"], fa, e, cons["ml_away_best"], v])
+            rows.append([gl, "Moneyline", away, mdl["p_away_ml"], fa, e, cons["ml_away_best"], v,
+                         _ml_rl_reason(away_rpg, home_rpg, away_era, home_era)])
         frh, fra = devig_two(cons["rl_home"], cons["rl_away"])
         if frh is not None:
             e, v = edge_ev(mdl["p_home_cover"], frh, cons["rl_home_best"])
-            rows.append([gl, "Run line", f"{home} -1.5", mdl["p_home_cover"], frh, e, cons["rl_home_best"], v])
+            rows.append([gl, "Run line", f"{home} -1.5", mdl["p_home_cover"], frh, e, cons["rl_home_best"], v,
+                         _ml_rl_reason(home_rpg, away_rpg, home_era, away_era)])
             e, v = edge_ev(mdl["p_away_cover"], fra, cons["rl_away_best"])
-            rows.append([gl, "Run line", f"{away} +1.5", mdl["p_away_cover"], fra, e, cons["rl_away_best"], v])
+            rows.append([gl, "Run line", f"{away} +1.5", mdl["p_away_cover"], fra, e, cons["rl_away_best"], v,
+                         _ml_rl_reason(away_rpg, home_rpg, away_era, home_era)])
         fo, fu = devig_two(cons["over"], cons["under"])
         if fo is not None and cons["total_line"] is not None:
             ln = cons["total_line"]
             e, v = edge_ev(mdl["p_over"], fo, cons["over_best"])
-            rows.append([gl, "Total", f"Over {ln}", mdl["p_over"], fo, e, cons["over_best"], v])
+            rows.append([gl, "Total", f"Over {ln}", mdl["p_over"], fo, e, cons["over_best"], v,
+                         _total_reason(home_rpg, away_rpg, home_era, away_era, pf, "Over")])
             e, v = edge_ev(mdl["p_under"], fu, cons["under_best"])
-            rows.append([gl, "Total", f"Under {ln}", mdl["p_under"], fu, e, cons["under_best"], v])
+            rows.append([gl, "Total", f"Under {ln}", mdl["p_under"], fu, e, cons["under_best"], v,
+                         _total_reason(home_rpg, away_rpg, home_era, away_era, pf, "Under")])
 
     if not rows:
         return None, "No matched games with usable odds.", meta
     df = pd.DataFrame(rows, columns=["Game", "Market", "Selection",
-                                     "Model %", "Fair %", "Edge", "Odds", "EV %"])
+                                     "Model %", "Fair %", "Edge", "Odds", "EV %", "Reason"])
     df["Model %"] = (df["Model %"] * 100).round(1)
     df["Fair %"] = (df["Fair %"] * 100).round(1)
     df["Edge"] = df["Edge"].round(1)
@@ -842,7 +894,11 @@ def build_prop_edges(sel_date, max_games=6):
         return None, {}, "No games scheduled for this date."
     odds_games, meta = fetch_mlb_odds(regions="uk")
     if not odds_games:
-        return None, meta, "No games/odds available."
+        if meta.get("error"):
+            return None, meta, f"Odds request failed: {meta['error']}"
+        return None, meta, ("No odds posted yet for today's games (this can happen "
+                            "earlier in the day before US books line up — try again "
+                            "closer to first pitch).")
     bat = fetch_all_mlb_batting_stats(sel_date.year)
     if bat.empty:
         return None, meta, "No batter stats available."
