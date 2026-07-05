@@ -42,6 +42,7 @@ if st.button("Analyse game bets (UK odds)"):
             "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f"),
             "Odds": st.column_config.NumberColumn("Best odds", format="%.2f"),
             "EV %": st.column_config.NumberColumn("EV %", format="%.1f"),
+            "Reason": st.column_config.TextColumn("Why it's a pick", width="large"),
         }
 
         def show_market(tab, market_name):
@@ -54,7 +55,7 @@ if st.button("Analyse game bets (UK odds)"):
                 sub = sub.copy()
                 sub.insert(0, "🚦", sub["Edge"].apply(_edge_light))
                 disp = sub[["🚦", "Start", "US Date", "Game", "Selection",
-                            "Model %", "Fair %", "Edge", "Odds", "EV %"]]
+                            "Model %", "Fair %", "Edge", "Odds", "EV %", "Reason"]]
                 st.dataframe(disp, use_container_width=True, hide_index=True,
                              column_config=cfg)
 
@@ -142,10 +143,11 @@ if isinstance(st.session_state.get("game_edges"), pd.DataFrame) and not st.sessi
                            "rather than a standard accumulator.")
             _sel.insert(0, "🚦", _sel["Edge"].apply(_edge_light))
             st.dataframe(_sel[["🚦", "Game", "Selection", "Market", "Model %", "Fair %",
-                               "Edge", "Odds"]], use_container_width=True, hide_index=True,
+                               "Edge", "Odds", "Reason"]], use_container_width=True, hide_index=True,
                          column_config={"🚦": st.column_config.TextColumn("", width="small"),
                                         "Odds": st.column_config.NumberColumn("Best odds", format="%.2f"),
-                                        "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f")})
+                                        "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f"),
+                                        "Reason": st.column_config.TextColumn("Why it's a pick", width="large")})
             st.caption("Model chance assumes legs are independent (true across different "
                        "games). A multi needs every leg to win, so it is high-variance even "
                        "when each leg has an edge — stake accordingly, and remember the model "

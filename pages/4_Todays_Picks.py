@@ -42,7 +42,7 @@ if st.button("Load today's picks"):
                     "Market %": r["Fair %"],
                     "Edge": r["Edge"],
                     "Odds": r["Odds"],
-                    "Note": "",
+                    "Note": r.get("Reason", ""),
                 })
 
     # Prop edges — build_prop_edges already filters to green + amber
