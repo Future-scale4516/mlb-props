@@ -161,15 +161,18 @@ if st.button("Rank most likely hitters"):
                 st.dataframe(sub[["Player", "Game", "Start", "Order", "Prob %"]].head(40),
                              use_container_width=True, hide_index=True, column_config=mlcfg)
 
-        ml_hr, ml_hit, ml_rbi, ml_run = st.tabs(
-            ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs"])
+        ml_hr, ml_hit, ml_rbi, ml_run, ml_combo = st.tabs(
+            ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs", "🎰 Runs+Hits+RBI"])
         show_ml(ml_hr, "Home Run")
         show_ml(ml_hit, "Hits")
         show_ml(ml_rbi, "RBI")
         show_ml(ml_run, "Runs")
+        show_ml(ml_combo, "Runs+Hits+RBI (1+)")
         st.caption("Most likely is not the same as best bet: a player can be very likely yet "
-                   "fairly priced (no value). Cross-reference with Player Prop Edges. Model "
-                   "is uncalibrated until backtested.")
+                   "fairly priced (no value). Cross-reference with Player Prop Edges. "
+                   "RBI and Runs probabilities include a calibration correction based on "
+                   "backtest data. The Runs+Hits+RBI market estimates probability of achieving "
+                   "at least one of the three, treating them as approximately independent.")
 
 
 if load_btn:
