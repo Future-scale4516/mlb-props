@@ -711,6 +711,45 @@ def _lineup_context(order, slot_to_pid, stat_by_id):
     return ahead_obp, behind_slg
 
 
+def _calibration_adjust(raw_p, market):
+    """Apply an empirical calibration correction to raw model probabilities for
+    markets where the backtest showed systematic overconfidence. Built from the
+    actual backtest data: RBI consistently over-predicts by a growing margin as
+    confidence rises (e.g. model says 55% → reality ~40%, model says 65% → reality ~47%).
+    Runs shows a similar but milder pattern. Hits and HR are already well-calibrated
+    and pass through unchanged.
+
+    The correction uses a simple linear shrinkage toward the base rate, with the
+    shrinkage fraction set per-market based on observed backtest gaps. This is
+    intentionally conservative — it pulls overconfident predictions partway back
+    rather than trying to perfectly remap every decile, which would overfit to a
+    specific backtest window."""
+    if market == "RBI":
+        # RBI backtest showed ~30% overconfidence in the 40-70% bands.
+        # Shrink toward the base rate (0.28) by 30%.
+        base = 0.28
+        shrink = 0.30
+        return raw_p * (1 - shrink) + base * shrink
+    elif market == "Runs":
+        # Runs showed ~15-20% overconfidence in the upper bands.
+        # Lighter shrinkage toward base rate (0.36).
+        base = 0.36
+        shrink = 0.18
+        return raw_p * (1 - shrink) + base * shrink
+    return raw_p
+
+
+def _combo_prob(probs):
+    """P(at least one of hits/runs/RBI >= 1), treating them as approximately
+    independent. Returns None if any input is missing."""
+    p_h = probs.get("batter_hits")
+    p_r = probs.get("batter_runs_scored")
+    p_rbi = probs.get("batter_rbis")
+    if p_h is None or p_r is None or p_rbi is None:
+        return None
+    return min(1 - (1 - p_h) * (1 - p_r) * (1 - p_rbi), 0.999)
+
+
 def prop_expected_counts(stat, pa, opp_hr9=LG_HR9, opp_k9=LG_K9, opp_whip=LG_WHIP,
                           ahead_obp=LG_OBP_DEFAULT, behind_slg=LG_SLG_DEFAULT,
                           park_hr=1.0, park_run=1.0):
@@ -984,6 +1023,8 @@ def build_prop_edges(sel_date, max_games=6):
                 lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9, opp_whip,
                                            ahead_obp, behind_slg, park["hr"], park["run"])
                 mp = _p_over_line(lam[mkey], od["point"])
+                if mp is not None:
+                    mp = _calibration_adjust(mp, LABEL[mkey])
                 bp, mode = market_prob(od["over"], od["under"])
                 if mp is None or bp is None:
                     continue
@@ -1052,10 +1093,20 @@ def build_most_likely(sel_date, max_games=15):
                 ahead_obp, behind_slg = _lineup_context(order, slot_to_pid, stat_by_id)
                 lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9, opp_whip,
                                            ahead_obp, behind_slg, park["hr"], park["run"])
+                probs = {}
+                player_name = pr.get("name") or srow.get("name")
                 for mkey, lbl in LABEL.items():
                     p = _p_over_line(lam[mkey], 0.5)
-                    rows.append([lbl, pr.get("name") or srow.get("name"), gl, start,
+                    if p is not None:
+                        p = _calibration_adjust(p, lbl)
+                    probs[mkey] = p
+                    rows.append([lbl, player_name, gl, start,
                                  int(order), round(p * 100, 1)])
+                # combo: P(at least one of hits/runs/RBI >= 1)
+                cp = _combo_prob(probs)
+                if cp is not None:
+                    rows.append(["Runs+Hits+RBI (1+)", player_name, gl, start,
+                                 int(order), round(cp * 100, 1)])
         if not had:
             no_lineups += 1
         n += 1
