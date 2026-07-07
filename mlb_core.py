@@ -280,6 +280,7 @@ def fetch_mlb_odds(regions: str = "us", markets: str = "h2h,spreads,totals",
 
 LEAGUE_RPG_DEFAULT = 4.4    # league runs/game per team (fallback)
 LEAGUE_ERA_DEFAULT = 4.10   # league ERA (fallback)
+LEAGUE_BULLPEN_ERA_DEFAULT = 4.20  # league bullpen ERA (fallback)
 SP_WEIGHT = 0.60            # share of a game credited to the starting pitcher
 
 
@@ -345,6 +346,51 @@ def fetch_team_offense(season: int):
     return out, league
 
 
+def _ip_to_outs(ip_value):
+    """Convert MLB's innings-pitched notation (e.g. '63.1' = 63 innings + 1 out,
+    '63.2' = 63 innings + 2 outs) into a plain out count."""
+    try:
+        s = str(ip_value)
+        if "." in s:
+            whole, frac = s.split(".")
+            return int(whole) * 3 + int(frac)
+        return int(float(s)) * 3
+    except Exception:
+        return 0
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_bullpen_era(season: int):
+    """Team bullpen ERA from the MLB Stats API, computed properly from aggregated
+    earned runs and innings across all pitchers with zero starts that season (true
+    relievers) — not an average of individual ERAs, which would be skewed by
+    small-sample call-ups. Returns dict{team_id: bullpen_era}."""
+    data = safe_get("https://statsapi.mlb.com/api/v1/stats", {
+        "stats": "season", "group": "pitching", "season": season,
+        "sportId": 1, "playerPool": "ALL", "limit": 3000,
+    })
+    agg = {}
+    for split in data.get("stats", [{}])[0].get("splits", []):
+        stat = split.get("stat", {})
+        if int(stat.get("gamesStarted") or 0) > 0:
+            continue  # only true relievers — anyone who started a game is excluded
+        t = split.get("team", {})
+        tid = int(t.get("id", 0) or 0)
+        if not tid:
+            continue
+        er = int(stat.get("earnedRuns") or 0)
+        outs = _ip_to_outs(stat.get("inningsPitched") or "0.0")
+        if tid not in agg:
+            agg[tid] = [0, 0]
+        agg[tid][0] += er
+        agg[tid][1] += outs
+    out = {}
+    for tid, (er, outs) in agg.items():
+        if outs > 0:
+            out[tid] = round(er / (outs / 3) * 9, 2)
+    return out
+
+
 def _pois_pmf(k, lam):
     if lam <= 0:
         return 1.0 if k == 0 else 0.0
@@ -357,9 +403,16 @@ def _pois_vector(lam, max_runs=18):
     return [x / s for x in v] if s else v
 
 
-def expected_runs(team_rpg, opp_era, league_rpg, league_era, park=1.0):
+def expected_runs(team_rpg, opp_era, league_rpg, league_era, park=1.0,
+                   opp_bullpen_era=None):
+    """opp_bullpen_era replaces the flat league-average filler in the pitching
+    blend with the actual opposing bullpen's quality — the starter covers ~60% of
+    a game (SP_WEIGHT), the bullpen covers the rest, and previously that remaining
+    40% was just assumed to be league-average pitching regardless of the real
+    opponent. Falls back to league_era if bullpen data isn't available."""
     off_idx = (team_rpg / league_rpg) if league_rpg > 0 else 1.0
-    blended_era = SP_WEIGHT * opp_era + (1 - SP_WEIGHT) * league_era
+    fill_era = opp_bullpen_era if opp_bullpen_era is not None else league_era
+    blended_era = SP_WEIGHT * opp_era + (1 - SP_WEIGHT) * fill_era
     pitch_idx = (blended_era / league_era) if league_era > 0 else 1.0
     return max(0.5, min(league_rpg * off_idx * pitch_idx * park, 12.0))
 
@@ -373,10 +426,14 @@ def _park_neutral_rpg(rpg, own_park_run):
 
 
 def model_game(home_rpg, away_rpg, home_opp_era, away_opp_era,
-               league_rpg, league_era, total_line, park=1.0):
-    """home_opp_era = ERA of the pitcher the HOME team faces (the away starter)."""
-    lam_home = expected_runs(home_rpg, home_opp_era, league_rpg, league_era, park)
-    lam_away = expected_runs(away_rpg, away_opp_era, league_rpg, league_era, park)
+               league_rpg, league_era, total_line, park=1.0,
+               home_opp_bullpen_era=None, away_opp_bullpen_era=None):
+    """home_opp_era = ERA of the pitcher the HOME team faces (the away starter).
+    home_opp_bullpen_era = bullpen ERA of the team the HOME team faces (away bullpen)."""
+    lam_home = expected_runs(home_rpg, home_opp_era, league_rpg, league_era, park,
+                             opp_bullpen_era=home_opp_bullpen_era)
+    lam_away = expected_runs(away_rpg, away_opp_era, league_rpg, league_era, park,
+                             opp_bullpen_era=away_opp_bullpen_era)
     ph = _pois_vector(lam_home); pa = _pois_vector(lam_away)
     p_hw = p_aw = p_tie = p_hc = p_ac = 0.0
     for h in range(len(ph)):
@@ -505,11 +562,12 @@ def _commence_to_et_str(iso):
     return d.strftime("%a %b %d") if d else ""
 
 
-def _ml_rl_reason(team_rpg, opp_rpg, team_era, opp_era,
-                   league_rpg=LEAGUE_RPG_DEFAULT, league_era=LEAGUE_ERA_DEFAULT):
+def _ml_rl_reason(team_rpg, opp_rpg, team_era, opp_era, opp_bullpen_era=None,
+                   league_rpg=LEAGUE_RPG_DEFAULT, league_era=LEAGUE_ERA_DEFAULT,
+                   league_bullpen_era=LEAGUE_BULLPEN_ERA_DEFAULT):
     """Short, honest explanation for a Moneyline/Run line pick, using the same
-    inputs the model actually used: park-neutral team offense and both starters'
-    ERA. Mirrors the style of _prop_reason."""
+    inputs the model actually used: park-neutral team offense, both starters'
+    ERA, and the opposing bullpen's ERA. Mirrors the style of _prop_reason."""
     bits = []
     if team_rpg - opp_rpg >= 0.5:
         bits.append(f"stronger offense ({team_rpg:.1f} vs {opp_rpg:.1f} RPG)")
@@ -517,6 +575,8 @@ def _ml_rl_reason(team_rpg, opp_rpg, team_era, opp_era,
         bits.append(f"quality starter (ERA {team_era:.2f})")
     if opp_era >= league_era + 0.4:
         bits.append(f"opposing starter has struggled (ERA {opp_era:.2f})")
+    if opp_bullpen_era is not None and opp_bullpen_era >= league_bullpen_era + 0.4:
+        bits.append(f"opposing bullpen is shaky (ERA {opp_bullpen_era:.2f})")
     if not bits:
         return "Edge from market pricing, not a standout matchup"
     joined = "; ".join(bits[:3])
@@ -524,16 +584,23 @@ def _ml_rl_reason(team_rpg, opp_rpg, team_era, opp_era,
 
 
 def _total_reason(home_rpg, away_rpg, home_era, away_era, park, side,
-                   league_rpg=LEAGUE_RPG_DEFAULT, league_era=LEAGUE_ERA_DEFAULT):
+                   home_bullpen_era=None, away_bullpen_era=None,
+                   league_rpg=LEAGUE_RPG_DEFAULT, league_era=LEAGUE_ERA_DEFAULT,
+                   league_bullpen_era=LEAGUE_BULLPEN_ERA_DEFAULT):
     """Short, honest explanation for a Totals (Over/Under) pick."""
     combined = home_rpg + away_rpg
     league_combined = league_rpg * 2
+    bp_avg = None
+    if home_bullpen_era is not None and away_bullpen_era is not None:
+        bp_avg = (home_bullpen_era + away_bullpen_era) / 2
     bits = []
     if side == "Over":
         if combined - league_combined >= 0.8:
             bits.append(f"both offenses hot ({combined:.1f} combined RPG)")
         if home_era >= league_era + 0.4 or away_era >= league_era + 0.4:
             bits.append("a shaky starter in this game")
+        if bp_avg is not None and bp_avg >= league_bullpen_era + 0.4:
+            bits.append("both bullpens shaky")
         if park.get("run", 1.0) >= 1.05:
             bits.append("hitter-friendly park")
     else:
@@ -541,6 +608,8 @@ def _total_reason(home_rpg, away_rpg, home_era, away_era, park, side,
             bits.append(f"quiet bats on both sides ({combined:.1f} combined RPG)")
         if home_era <= league_era - 0.4 and away_era <= league_era - 0.4:
             bits.append("two quality starters")
+        if bp_avg is not None and bp_avg <= league_bullpen_era - 0.4:
+            bits.append("both bullpens strong")
         if park.get("run", 1.0) <= 0.95:
             bits.append("pitcher-friendly park")
     if not bits:
@@ -555,6 +624,7 @@ def build_game_edges(sel_date):
     if sched.empty:
         return None, "No games scheduled for this date.", {}
     team_off, league_rpg = fetch_team_offense(sel_date.year)
+    bullpen_era = fetch_bullpen_era(sel_date.year)
     odds_data, meta = fetch_mlb_odds(regions="uk")
     if meta.get("error"):
         return None, meta["error"], meta
@@ -597,10 +667,13 @@ def build_game_edges(sel_date):
                                      PARK_FACTORS.get(aid, NEUTRAL_PARK)["run"])
         away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
         home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
+        away_bp = bullpen_era.get(aid, LEAGUE_BULLPEN_ERA_DEFAULT)
+        home_bp = bullpen_era.get(hid, LEAGUE_BULLPEN_ERA_DEFAULT)
         cons = consolidate_odds(og, og.get("home_team"), og.get("away_team"))
         mdl = model_game(home_rpg, away_rpg, away_sp.get("era", 4.5),
                          home_sp.get("era", 4.5), league_rpg, LEAGUE_ERA_DEFAULT,
-                         cons.get("total_line"), park=pf["run"])
+                         cons.get("total_line"), park=pf["run"],
+                         home_opp_bullpen_era=away_bp, away_opp_bullpen_era=home_bp)
         gl = f"{TEAM_ABBR.get(aid, away)} @ {TEAM_ABBR.get(hid, home)}"
         ct = og.get("commence_time") or ""
         game_time[gl] = (ct, _commence_to_bst(ct), _commence_to_et_str(ct))
@@ -611,27 +684,29 @@ def build_game_edges(sel_date):
         if fh is not None:
             e, v = edge_ev(mdl["p_home_ml"], fh, cons["ml_home_best"])
             rows.append([gl, "Moneyline", home, mdl["p_home_ml"], fh, e, cons["ml_home_best"], v,
-                         _ml_rl_reason(home_rpg, away_rpg, home_era, away_era)])
+                         _ml_rl_reason(home_rpg, away_rpg, home_era, away_era, away_bp)])
             e, v = edge_ev(mdl["p_away_ml"], fa, cons["ml_away_best"])
             rows.append([gl, "Moneyline", away, mdl["p_away_ml"], fa, e, cons["ml_away_best"], v,
-                         _ml_rl_reason(away_rpg, home_rpg, away_era, home_era)])
+                         _ml_rl_reason(away_rpg, home_rpg, away_era, home_era, home_bp)])
         frh, fra = devig_two(cons["rl_home"], cons["rl_away"])
         if frh is not None:
             e, v = edge_ev(mdl["p_home_cover"], frh, cons["rl_home_best"])
             rows.append([gl, "Run line", f"{home} -1.5", mdl["p_home_cover"], frh, e, cons["rl_home_best"], v,
-                         _ml_rl_reason(home_rpg, away_rpg, home_era, away_era)])
+                         _ml_rl_reason(home_rpg, away_rpg, home_era, away_era, away_bp)])
             e, v = edge_ev(mdl["p_away_cover"], fra, cons["rl_away_best"])
             rows.append([gl, "Run line", f"{away} +1.5", mdl["p_away_cover"], fra, e, cons["rl_away_best"], v,
-                         _ml_rl_reason(away_rpg, home_rpg, away_era, home_era)])
+                         _ml_rl_reason(away_rpg, home_rpg, away_era, home_era, home_bp)])
         fo, fu = devig_two(cons["over"], cons["under"])
         if fo is not None and cons["total_line"] is not None:
             ln = cons["total_line"]
             e, v = edge_ev(mdl["p_over"], fo, cons["over_best"])
             rows.append([gl, "Total", f"Over {ln}", mdl["p_over"], fo, e, cons["over_best"], v,
-                         _total_reason(home_rpg, away_rpg, home_era, away_era, pf, "Over")])
+                         _total_reason(home_rpg, away_rpg, home_era, away_era, pf, "Over",
+                                       home_bp, away_bp)])
             e, v = edge_ev(mdl["p_under"], fu, cons["under_best"])
             rows.append([gl, "Total", f"Under {ln}", mdl["p_under"], fu, e, cons["under_best"], v,
-                         _total_reason(home_rpg, away_rpg, home_era, away_era, pf, "Under")])
+                         _total_reason(home_rpg, away_rpg, home_era, away_era, pf, "Under",
+                                       home_bp, away_bp)])
 
     if not rows:
         return None, "No matched games with usable odds.", meta
@@ -1144,6 +1219,7 @@ def run_backtest(sel_date, days_back=14):
     """Score the game model against real final scores from recent completed games.
     Returns (records, days_with_games) where each record is (market, pred_prob, outcome)."""
     team_off, league_rpg = fetch_team_offense(sel_date.year)
+    bullpen_era = fetch_bullpen_era(sel_date.year)
     recs, days_done = [], 0
     for i in range(1, days_back + 1):
         day = sel_date - timedelta(days=i)
@@ -1160,9 +1236,12 @@ def run_backtest(sel_date, days_back=14):
                                          PARK_FACTORS.get(aid, NEUTRAL_PARK)["run"])
             away_sp = fetch_pitcher_stats(r.get("away_prob_id")) if r.get("away_prob_id") else {"era": 4.5}
             home_sp = fetch_pitcher_stats(r.get("home_prob_id")) if r.get("home_prob_id") else {"era": 4.5}
+            away_bp = bullpen_era.get(aid, LEAGUE_BULLPEN_ERA_DEFAULT)
+            home_bp = bullpen_era.get(hid, LEAGUE_BULLPEN_ERA_DEFAULT)
             mdl = model_game(home_rpg, away_rpg, away_sp.get("era", 4.5),
                              home_sp.get("era", 4.5), league_rpg, LEAGUE_ERA_DEFAULT,
-                             8.5, park=park["run"])
+                             8.5, park=park["run"],
+                             home_opp_bullpen_era=away_bp, away_opp_bullpen_era=home_bp)
             total = r["home_score"] + r["away_score"]
             margin = r["home_score"] - r["away_score"]
             recs.append(("Moneyline (home win)", mdl["p_home_ml"], 1 if margin > 0 else 0))
