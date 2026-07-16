@@ -60,12 +60,12 @@ if st.button("Run game backtest"):
 
 st.divider()
 st.markdown("## 🎯 Player Prop Backtest — calibration")
-st.caption("Checks the batter prop model (Home Run, Hits, RBI, Runs, and the combined "
-           "'1+ of Runs/Hits/RBI' market) against real box scores from recent completed "
-           "games — the same idea as the game backtest, but for props. This is the check "
-           "that tells you whether prop edges are trustworthy the way game-bet edges are. "
-           "Free — no odds or quota needed, but box scores mean more calls per game, so "
-           "start with a smaller window.")
+st.caption("Checks the batter prop model (Home Run, Hits, RBI, Runs, Total Bases, and the "
+           "combined '1+ of Runs/Hits/RBI' market) against real box scores from recent "
+           "completed games — the same idea as the game backtest, but for props. This is "
+           "the check that tells you whether prop edges are trustworthy the way game-bet "
+           "edges are. Free — no odds or quota needed, but box scores mean more calls per "
+           "game, so start with a smaller window.")
 pbt_days = st.slider("Days of completed games to test", 3, 21, 7, key="prop_bt_days")
 if st.button("Run player prop backtest"):
     with st.spinner("Fetching box scores and scoring the prop model against them "
@@ -77,7 +77,8 @@ if st.button("Run player prop backtest"):
         st.caption(f"Scored {pbt_games} game(s) across {pbt_days_done} day(s) — "
                    f"{len(pbt_recs)} batter-market outcomes in total. Lower Brier = better; "
                    "the model line should hug the dashed diagonal.")
-        for pbt_market in ["Home Run", "Hits", "RBI", "Runs", "Runs+Hits+RBI (1+)"]:
+        for pbt_market in ["Home Run", "Hits", "RBI", "Runs", "Runs+Hits+RBI (1+)",
+                           "Total Bases (2+)"]:
             render_calibration(pbt_recs, pbt_market)
         st.caption("Caveats: uses current-season batter/pitcher stats applied to past games "
                    "(mild lookahead), and each batter's real starting slot from the box score "
@@ -85,5 +86,8 @@ if st.button("Run player prop backtest"):
                    "pre-game lineup guess). The '1+ of Runs/Hits/RBI' market is estimated by "
                    "combining the three single-market probabilities as if independent — a "
                    "reasonable approximation, not exact, since a hit that leads to a run isn't "
-                   "fully independent of the run itself. This validates model calibration, NOT "
-                   "whether you'd beat a bookmaker on props.")
+                   "fully independent of the run itself. 'Total Bases (2+)' is tested at a 1.5 "
+                   "line (any single already gives 1 TB, so 0.5 would just duplicate Hits) and "
+                   "is new and unvalidated — unlike RBI/Runs, it has no calibration correction "
+                   "applied yet since there's no backtest history for it. This validates model "
+                   "calibration, NOT whether you'd beat a bookmaker on props.")
