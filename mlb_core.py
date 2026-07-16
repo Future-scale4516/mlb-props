@@ -835,7 +835,10 @@ def prop_expected_counts(stat, pa, opp_hr9=LG_HR9, opp_k9=LG_K9, opp_whip=LG_WHI
     ahead of him (real traffic on base for him to drive in — the pitcher's WHIP
     alone doesn't say whether THIS batter's teammates are the ones reaching).
     Runs uses WHIP plus the SLG of the batters hitting behind him (someone has to
-    drive him in once he's on base)."""
+    drive him in once he's on base). Total Bases is built from the batter's own
+    SLG (bases per at-bat) — a good pitcher's low HR9 suppresses power, a high K9
+    suppresses contact overall, and park blends both HR- and hit-friendliness
+    since extra-base hits benefit from both."""
     spa = max(stat.get("plateAppearances", 1) or 1, 1)
     hr_l = (stat.get("hr", 0) / spa) * (opp_hr9 / LG_HR9) * park_hr * pa
     hits = stat.get("hits")
@@ -850,8 +853,14 @@ def prop_expected_counts(stat, pa, opp_hr9=LG_HR9, opp_k9=LG_K9, opp_whip=LG_WHI
     support_factor = 1.0 + 0.5 * min(max((behind_slg - LG_SLG_DEFAULT) / LG_SLG_DEFAULT, -0.4), 0.4)
     run_l = (stat.get("runs", 0) / spa) * (0.6 + 0.4 * park_run) * whip_factor * support_factor * pa
 
+    ab_est = pa * 0.89  # rough PA->AB conversion; ~11% of PA are walks/HBP/sac
+    power_factor = 1.0 + 0.5 * min(max((opp_hr9 - LG_HR9) / LG_HR9, -0.3), 0.3)
+    tb_park = 0.6 * park_hr + 0.4 * park_run
+    tb_l = stat.get("slg", LG_SLG_DEFAULT) * ab_est * k_factor * power_factor * tb_park
+
     return {"batter_home_runs": hr_l, "batter_hits": hit_l,
-            "batter_rbis": rbi_l, "batter_runs_scored": run_l}
+            "batter_rbis": rbi_l, "batter_runs_scored": run_l,
+            "batter_total_bases": tb_l}
 
 
 def consolidate_prop(event, market_key):
@@ -985,7 +994,7 @@ def _prop_reason(mkey, srow, opp_hr9, opp_k9, park, order, ahead_obp=LG_OBP_DEFA
             bits.append("high rate for this market")
         if park["run"] >= 1.05:
             bits.append("hitter-friendly park")
-    else:  # runs scored
+    elif mkey == "batter_runs_scored":
         if behind_slg >= 0.430:
             bits.append(f"power hitters behind (.{int(round(behind_slg*1000)):03d} SLG)")
         if order and order <= 5:
@@ -994,6 +1003,15 @@ def _prop_reason(mkey, srow, opp_hr9, opp_k9, park, order, ahead_obp=LG_OBP_DEFA
         if rate >= 0.13:
             bits.append("high rate for this market")
         if park["run"] >= 1.05:
+            bits.append("hitter-friendly park")
+    else:  # batter_total_bases
+        if srow.get("slg", 0) >= 0.460:
+            bits.append(f"strong slugger (.{int(round(srow.get('slg', 0) * 1000)):03d} SLG)")
+        if opp_hr9 >= 1.4:
+            bits.append(f"HR-prone starter ({opp_hr9:.1f} HR/9)")
+        if opp_k9 <= 7.5:
+            bits.append(f"low-strikeout starter ({opp_k9:.1f} K/9)")
+        if park["hr"] >= 1.05:
             bits.append("hitter-friendly park")
     if not bits:
         return "Edge from market pricing, not a standout matchup"
@@ -1023,9 +1041,10 @@ def build_prop_edges(sel_date, max_games=6):
     sched_index = {(norm(gm.get("home_team")), norm(gm.get("away_team"))): gm
                    for _, gm in sched.iterrows()}
 
-    PROP_MARKETS = "batter_home_runs,batter_hits,batter_rbis,batter_runs_scored"
+    PROP_MARKETS = "batter_home_runs,batter_hits,batter_rbis,batter_runs_scored,batter_total_bases"
     LABEL = {"batter_home_runs": "Home Run", "batter_hits": "Hits",
-             "batter_rbis": "RBI", "batter_runs_scored": "Runs"}
+             "batter_rbis": "RBI", "batter_runs_scored": "Runs",
+             "batter_total_bases": "Total Bases"}
     cols = ["Market", "Light", "Player", "Game", "Start", "Line",
             "Model %", "Market %", "Edge", "Best over", "Reason"]
     rows, unmatched = [], []
@@ -1182,12 +1201,16 @@ def build_most_likely(sel_date, max_games=15):
                 if cp is not None:
                     rows.append(["Runs+Hits+RBI (1+)", player_name, gl, start,
                                  int(order), round(cp * 100, 1)])
+                # Total Bases: expected value, not a "1+" probability (any hit is
+                # already >=1 TB, so a threshold framing would just duplicate Hits)
+                rows.append(["Total Bases (expected)", player_name, gl, start,
+                             int(order), round(lam["batter_total_bases"], 2)])
         if not had:
             no_lineups += 1
         n += 1
     if not rows:
         return None, "No confirmed lineups posted yet for these games (try closer to first pitch)."
-    df = pd.DataFrame(rows, columns=["Market", "Player", "Game", "Start", "Order", "Prob %"])
+    df = pd.DataFrame(rows, columns=["Market", "Player", "Game", "Start", "Order", "Value"])
     note = f"Ranked batters across {n - no_lineups} game(s) with confirmed lineups."
     if no_lineups:
         note += f" {no_lineups} game(s) had no lineup posted yet."
@@ -1281,6 +1304,7 @@ def fetch_boxscore_batters(game_pk):
                 "hr": int(bat.get("homeRuns") or 0),
                 "rbi": int(bat.get("rbi") or 0),
                 "runs": int(bat.get("runs") or 0),
+                "total_bases": int(bat.get("totalBases") or 0),
             })
     return out
 
@@ -1356,6 +1380,13 @@ def run_prop_backtest(sel_date, days_back=14, max_games_per_day=None):
                                   (1 - probs["batter_rbis"])
                     outcome_combo = 1 if (b["hits"] >= 1 or b["runs"] >= 1 or b["rbi"] >= 1) else 0
                     recs.append(("Runs+Hits+RBI (1+)", min(p_combo, 0.999), outcome_combo))
+                # Total Bases tested at a 1.5 line (i.e. 2+ bases) rather than 0.5 —
+                # any single already counts as 1 TB, so a 0.5 threshold would just
+                # duplicate the Hits market and tell us nothing new.
+                p_tb = _p_over_line(lam["batter_total_bases"], 1.5)
+                if p_tb is not None:
+                    outcome_tb = 1 if b["total_bases"] > 1.5 else 0
+                    recs.append(("Total Bases (2+)", p_tb, outcome_tb))
     return recs, days_done, games_scored
 
 
