@@ -118,12 +118,13 @@ if st.button("Find player prop edges (US books)"):
                     st.dataframe(disp, use_container_width=True, hide_index=True,
                                  column_config=pcfg)
 
-            hr_t, hit_t, rbi_t, run_t = st.tabs(
-                ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs"])
+            hr_t, hit_t, rbi_t, run_t, tb_t = st.tabs(
+                ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs", "📦 Total Bases"])
             show_prop_market(hr_t, "Home Run")
             show_prop_market(hit_t, "Hits")
             show_prop_market(rbi_t, "RBI")
             show_prop_market(run_t, "Runs")
+            show_prop_market(tb_t, "Total Bases")
             st.caption("🟢 edge 2–8 · 🟡 8–15. Reds (15+) and no-signal (<2) are hidden. "
                        "Model %: our probability · Market %: de-vigged book probability · "
                        "Best over: best decimal price across US books. The model is still "
@@ -142,37 +143,51 @@ if st.button("Rank most likely hitters"):
         st.warning(ml_note)
     else:
         st.caption(ml_note)
-        mlcfg = {
+        mlcfg_pct = {
             "Player": st.column_config.TextColumn("Player", width="large"),
             "Game": st.column_config.TextColumn("Game", width="small"),
             "Start": st.column_config.TextColumn("Start", width="small"),
             "Order": st.column_config.NumberColumn("Slot", format="%d"),
-            "Prob %": st.column_config.ProgressColumn("Model prob %", min_value=0,
-                                                      max_value=100, format="%.1f"),
+            "Value": st.column_config.ProgressColumn("Model prob %", min_value=0,
+                                                     max_value=100, format="%.1f"),
+        }
+        mlcfg_tb = {
+            "Player": st.column_config.TextColumn("Player", width="large"),
+            "Game": st.column_config.TextColumn("Game", width="small"),
+            "Start": st.column_config.TextColumn("Start", width="small"),
+            "Order": st.column_config.NumberColumn("Slot", format="%d"),
+            "Value": st.column_config.NumberColumn("Expected TB", format="%.2f"),
         }
 
-        def show_ml(tab, label):
+        def show_ml(tab, label, is_tb=False):
             with tab:
                 sub = ml_df[ml_df["Market"] == label].sort_values(
-                    "Prob %", ascending=False).reset_index(drop=True)
+                    "Value", ascending=False).reset_index(drop=True)
                 if sub.empty:
                     st.write("No ranked batters for this market.")
                     return
-                st.dataframe(sub[["Player", "Game", "Start", "Order", "Prob %"]].head(40),
-                             use_container_width=True, hide_index=True, column_config=mlcfg)
+                st.dataframe(sub[["Player", "Game", "Start", "Order", "Value"]].head(40),
+                             use_container_width=True, hide_index=True,
+                             column_config=(mlcfg_tb if is_tb else mlcfg_pct))
 
-        ml_hr, ml_hit, ml_rbi, ml_run, ml_combo = st.tabs(
-            ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs", "🎰 Runs+Hits+RBI"])
+        ml_hr, ml_hit, ml_rbi, ml_run, ml_combo, ml_tb = st.tabs(
+            ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs", "🎰 Runs+Hits+RBI", "📦 Total Bases"])
         show_ml(ml_hr, "Home Run")
         show_ml(ml_hit, "Hits")
         show_ml(ml_rbi, "RBI")
         show_ml(ml_run, "Runs")
         show_ml(ml_combo, "Runs+Hits+RBI (1+)")
+        show_ml(ml_tb, "Total Bases (expected)", is_tb=True)
         st.caption("Most likely is not the same as best bet: a player can be very likely yet "
                    "fairly priced (no value). Cross-reference with Player Prop Edges. "
                    "RBI and Runs probabilities include a calibration correction based on "
                    "backtest data. The Runs+Hits+RBI market estimates probability of achieving "
-                   "at least one of the three, treating them as approximately independent.")
+                   "at least one of the three, treating them as approximately independent. "
+                   "Total Bases is shown as an expected value, not a '1+' probability — since "
+                   "any hit already counts as 1+ total base, a threshold framing here would "
+                   "just duplicate the Hits market; compare the expected value against the "
+                   "book's line (often 1.5 or 2.5) yourself, or check Player Prop Edges for "
+                   "the priced-in version.")
 
 
 if load_btn:
