@@ -80,6 +80,8 @@ def fetch_schedule(target_date: str):
 
             rows.append({
                 "gamePk":         g.get("gamePk"),
+                "game_number":    g.get("gameNumber", 1),
+                "double_header":  g.get("doubleHeader", "N"),  # Y/S = doubleheader, N = single
                 "status":         g.get("status",{}).get("detailedState", "Scheduled"),
                 "away_team":      t.get("away",{}).get("team",{}).get("name"),
                 "home_team":      t.get("home",{}).get("team",{}).get("name"),
@@ -465,8 +467,15 @@ def _median(xs):
 
 
 def consolidate_odds(game, home, away):
-    """Consensus (median) decimal odds + best available price per outcome."""
-    ml_home, ml_away, rl_home, rl_away = [], [], [], []
+    """Consensus (median) decimal odds + best available price per outcome.
+    Run line (spreads) is bucketed by point value, same as totals — a book
+    occasionally posts an alternate run line (e.g. ±0.5 or ±2.5 alongside the
+    standard ±1.5), and without bucketing, prices from different lines get
+    silently averaged together into a number that doesn't price any single
+    real market, which is why a paired-side implied-probability sum could come
+    out far from a sane ~100-110% instead of reflecting one coherent line."""
+    ml_home, ml_away = [], []
+    rl_by_line = {}
     tot_by_line = {}
     for bk in game.get("bookmakers", []):
         for m in bk.get("markets", []):
@@ -477,8 +486,11 @@ def consolidate_odds(game, home, away):
                     if name == home: ml_home.append(price)
                     elif name == away: ml_away.append(price)
                 elif key == "spreads":
-                    if name == home: rl_home.append(price)
-                    elif name == away: rl_away.append(price)
+                    if point is None: continue
+                    abs_pt = abs(point)
+                    slot = rl_by_line.setdefault(abs_pt, {"home": [], "away": []})
+                    if name == home: slot["home"].append(price)
+                    elif name == away: slot["away"].append(price)
                 elif key == "totals":
                     if point is None: continue
                     slot = tot_by_line.setdefault(point, {"over": [], "under": []})
@@ -489,14 +501,23 @@ def consolidate_odds(game, home, away):
         c = min(len(d["over"]), len(d["under"]))
         if c > best_count and c > 0:
             best_count, best_line = c, pt
+    best_rl_line, best_rl_count = None, -1
+    for pt, d in rl_by_line.items():
+        c = min(len(d["home"]), len(d["away"]))
+        if c > best_rl_count and c > 0:
+            best_rl_count, best_rl_line = c, pt
     res = {"ml_home": _median(ml_home), "ml_away": _median(ml_away),
            "ml_home_best": max(ml_home) if ml_home else None,
            "ml_away_best": max(ml_away) if ml_away else None,
-           "rl_home": _median(rl_home), "rl_away": _median(rl_away),
-           "rl_home_best": max(rl_home) if rl_home else None,
-           "rl_away_best": max(rl_away) if rl_away else None,
+           "rl_home": None, "rl_away": None,
+           "rl_home_best": None, "rl_away_best": None, "rl_line": best_rl_line,
            "total_line": best_line, "over": None, "under": None,
            "over_best": None, "under_best": None}
+    if best_rl_line is not None:
+        d = rl_by_line[best_rl_line]
+        res["rl_home"], res["rl_away"] = _median(d["home"]), _median(d["away"])
+        res["rl_home_best"] = max(d["home"]) if d["home"] else None
+        res["rl_away_best"] = max(d["away"]) if d["away"] else None
     if best_line is not None:
         d = tot_by_line[best_line]
         res["over"], res["under"] = _median(d["over"]), _median(d["under"])
@@ -560,6 +581,60 @@ def _commence_to_et_str(iso):
     """US-Eastern display date, e.g. 'Mon Jun 30'."""
     d = _commence_to_et_date(iso)
     return d.strftime("%a %b %d") if d else ""
+
+
+def _parse_iso_utc(iso):
+    """Parse an ISO UTC timestamp (either API's format) into a naive datetime for
+    time-distance comparisons. Returns None on failure."""
+    if not iso:
+        return None
+    try:
+        return datetime.strptime(str(iso).replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return None
+
+
+def _index_by_teams(items, home_key, away_key):
+    """Build a {(home,away): [items]} index that keeps ALL matches per team pair,
+    not just the last one. Doubleheaders mean the same two teams can appear twice
+    in one day's odds or schedule — a plain dict comprehension silently drops one
+    of them; this keeps both so they can be disambiguated by kickoff time."""
+    idx = {}
+    for it in items:
+        home = (it.get(home_key) or "").lower().strip()
+        away = (it.get(away_key) or "").lower().strip()
+        idx.setdefault((home, away), []).append(it)
+    return idx
+
+
+def _pick_closest_time(candidates, target_dt, time_getter):
+    """From a list of candidate dicts, return the one whose parsed time is closest
+    to target_dt. Falls back to the first candidate if timestamps are unusable —
+    this only matters when there are 2+ candidates (a doubleheader); with exactly
+    one candidate it's a no-op."""
+    if not candidates:
+        return None
+    if len(candidates) == 1 or target_dt is None:
+        return candidates[0]
+    best, best_diff = candidates[0], None
+    for c in candidates:
+        c_dt = _parse_iso_utc(time_getter(c))
+        if c_dt is None:
+            continue
+        diff = abs((c_dt - target_dt).total_seconds())
+        if best_diff is None or diff < best_diff:
+            best, best_diff = c, diff
+    return best
+
+
+def _dh_suffix(gm):
+    """(1)/(2) suffix for a schedule row that's part of a doubleheader, else ''."""
+    try:
+        gn = int(gm.get("game_number", 1) or 1)
+    except Exception:
+        gn = 1
+    dh = str(gm.get("double_header", "N") or "N")
+    return f" ({gn})" if dh in ("Y", "S") and gn else ""
 
 
 def _ml_rl_reason(team_rpg, opp_rpg, team_era, opp_era, opp_bullpen_era=None,
@@ -644,18 +719,23 @@ def build_game_edges(sel_date):
             meta["dropped_wrong_day"] = dropped
 
     def norm(s): return (s or "").lower().strip()
-    odds_index = {(norm(g.get("home_team")), norm(g.get("away_team"))): g for g in odds_data}
+    odds_index = _index_by_teams(odds_data, "home_team", "away_team")
 
     rows, unmatched, game_time = [], [], {}
     for _, gm in sched.iterrows():
         home, away = gm.get("home_team"), gm.get("away_team")
-        og = odds_index.get((norm(home), norm(away)))
-        if not og:
+        candidates = odds_index.get((norm(home), norm(away)), [])
+        if not candidates:
             hk = norm(home).split()[-1] if norm(home).split() else ""
             ak = norm(away).split()[-1] if norm(away).split() else ""
-            for (oh, oa), cand in odds_index.items():
+            for (oh, oa), cands in odds_index.items():
                 if hk and ak and oh.endswith(hk) and oa.endswith(ak):
-                    og = cand; break
+                    candidates = cands; break
+        # Doubleheaders put two odds events under the same team-name key — pick
+        # whichever one's kickoff time is actually closest to THIS schedule row's
+        # real start time, rather than silently taking whichever came first/last.
+        og = _pick_closest_time(candidates, _parse_iso_utc(gm.get("game_date_raw")),
+                                 lambda c: c.get("commence_time"))
         if not og:
             unmatched.append(f"{away} @ {home}"); continue
 
@@ -674,7 +754,7 @@ def build_game_edges(sel_date):
                          home_sp.get("era", 4.5), league_rpg, LEAGUE_ERA_DEFAULT,
                          cons.get("total_line"), park=pf["run"],
                          home_opp_bullpen_era=away_bp, away_opp_bullpen_era=home_bp)
-        gl = f"{TEAM_ABBR.get(aid, away)} @ {TEAM_ABBR.get(hid, home)}"
+        gl = f"{TEAM_ABBR.get(aid, away)} @ {TEAM_ABBR.get(hid, home)}{_dh_suffix(gm)}"
         ct = og.get("commence_time") or ""
         game_time[gl] = (ct, _commence_to_bst(ct), _commence_to_et_str(ct))
 
@@ -689,7 +769,12 @@ def build_game_edges(sel_date):
             rows.append([gl, "Moneyline", away, mdl["p_away_ml"], fa, e, cons["ml_away_best"], v,
                          _ml_rl_reason(away_rpg, home_rpg, away_era, home_era, home_bp)])
         frh, fra = devig_two(cons["rl_home"], cons["rl_away"])
-        if frh is not None:
+        # The model only ever computes "win by 2+ runs" (a 1.5-run margin) — only
+        # show Run Line when that's genuinely the line being priced, so a "-1.5"/
+        # "+1.5" label is never paired with a probability computed for a different
+        # margin (this is what the bucket-by-point fix above makes possible to check).
+        rl_is_standard = cons.get("rl_line") is not None and abs(cons["rl_line"] - 1.5) < 0.01
+        if frh is not None and rl_is_standard:
             e, v = edge_ev(mdl["p_home_cover"], frh, cons["rl_home_best"])
             rows.append([gl, "Run line", f"{home} -1.5", mdl["p_home_cover"], frh, e, cons["rl_home_best"], v,
                          _ml_rl_reason(home_rpg, away_rpg, home_era, away_era, away_bp)])
@@ -1038,8 +1123,7 @@ def build_prop_edges(sel_date, max_games=6):
     stat_by_id = {int(r["player_id"]): r for r in bat.to_dict("records") if r.get("player_id")}
 
     def norm(s): return (s or "").lower().strip()
-    sched_index = {(norm(gm.get("home_team")), norm(gm.get("away_team"))): gm
-                   for _, gm in sched.iterrows()}
+    sched_index = _index_by_teams([gm for _, gm in sched.iterrows()], "home_team", "away_team")
 
     PROP_MARKETS = "batter_home_runs,batter_hits,batter_rbis,batter_runs_scored,batter_total_bases"
     LABEL = {"batter_home_runs": "Home Run", "batter_hits": "Hits",
@@ -1054,13 +1138,17 @@ def build_prop_edges(sel_date, max_games=6):
         if analysed >= max_games:
             break
         home, away = ev.get("home_team"), ev.get("away_team")
-        gm = sched_index.get((norm(home), norm(away)))
-        if gm is None:
+        candidates = sched_index.get((norm(home), norm(away)), [])
+        if not candidates:
             hk = norm(home).split()[-1] if norm(home).split() else ""
             ak = norm(away).split()[-1] if norm(away).split() else ""
-            for (oh, oa), cand in sched_index.items():
+            for (oh, oa), cands in sched_index.items():
                 if hk and ak and oh.endswith(hk) and oa.endswith(ak):
-                    gm = cand; break
+                    candidates = cands; break
+        # Same doubleheader disambiguation as build_game_edges: pick the schedule
+        # row whose real kickoff is closest to this specific odds event's time.
+        gm = _pick_closest_time(candidates, _parse_iso_utc(ev.get("commence_time")),
+                                 lambda c: c.get("game_date_raw"))
         if gm is None:
             unmatched.append(f"{away} @ {home}"); continue
 
@@ -1090,7 +1178,7 @@ def build_prop_edges(sel_date, max_games=6):
         except Exception:
             pass
 
-        gl = f"{TEAM_ABBR.get(away_id, away)} @ {TEAM_ABBR.get(home_id, home)}"
+        gl = f"{TEAM_ABBR.get(away_id, away)} @ {TEAM_ABBR.get(home_id, home)}{_dh_suffix(gm)}"
         start = _commence_to_bst(ev.get("commence_time") or "")
         for mkey in PROP_MARKETS.split(","):
             for player, od in consolidate_prop(event, mkey).items():
@@ -1136,6 +1224,113 @@ def build_prop_edges(sel_date, max_games=6):
     return pd.DataFrame(rows, columns=cols), last_meta, note
 
 
+MARKET_TRUST_TIER = {
+    # Relative weights for stake allocation, built from backtest history and real
+    # results: Moneyline is the best-calibrated market; Run Line and Runs are solid;
+    # Totals and Total Bases are decent but less battle-tested; RBI is the weakest
+    # even with its calibration correction. Home Run is handled separately as a
+    # small flat "lottery ticket" slice, not part of this proportional split.
+    "Moneyline": 3.0, "Run Line": 2.0, "Runs": 2.0,
+    "Totals": 1.5, "Total Bases": 1.5, "RBI": 1.0,
+}
+
+
+def _normalize_game_row(row):
+    return {"label": row["Selection"], "game": row["Game"], "odds": float(row["Odds"]),
+            "model_pct": float(row["Model %"]), "reason": row.get("Reason", "")}
+
+
+def _normalize_prop_row(row):
+    return {"label": f"{row['Player']} {row['Line']}", "game": row["Game"],
+            "odds": float(row["Best over"]), "model_pct": float(row["Model %"]),
+            "reason": row.get("Reason", "")}
+
+
+def _best_combo(candidates, n_legs, normalize_fn):
+    """Greedily pick the n_legs highest-Model% rows from DIFFERENT games (ranked by
+    raw model probability, not edge size — a bigger amber edge isn't automatically
+    riskier if the underlying probability is still sane). Returns None if fewer than
+    n_legs distinct-game candidates are available."""
+    if candidates is None or candidates.empty:
+        return None
+    sorted_df = candidates.sort_values("Model %", ascending=False)
+    chosen, used_games = [], set()
+    for _, row in sorted_df.iterrows():
+        norm = normalize_fn(row)
+        if norm["game"] in used_games:
+            continue
+        chosen.append(norm)
+        used_games.add(norm["game"])
+        if len(chosen) == n_legs:
+            break
+    if len(chosen) < n_legs:
+        return None
+    combined_odds = 1.0
+    combined_prob = 1.0
+    for leg in chosen:
+        combined_odds *= leg["odds"]
+        combined_prob *= leg["model_pct"] / 100.0
+    return {"legs": chosen, "combined_odds": combined_odds, "combined_prob": combined_prob}
+
+
+def build_suggested_bets(sel_date, prop_max_games=6):
+    """Auto-build green/amber (edge 2-15) doubles and trebles across Moneyline, Run
+    Line, Totals, Runs, RBI, Total Bases, and Home Run (Hits excluded — use the
+    dedicated Player Props page for that). Ranked by raw Model %, no two legs from
+    the same game. Returns (results dict keyed by market, quota metadata dict)."""
+    results = {}
+    quota_meta = {}
+
+    gdf, gnote, gmeta = build_game_edges(sel_date)
+    quota_meta["game"] = gmeta
+    for label in ["Moneyline", "Run line", "Total"]:
+        out_key = {"Moneyline": "Moneyline", "Run line": "Run Line", "Total": "Totals"}[label]
+        if gdf is not None and not gdf.empty:
+            sub = gdf[(gdf["Market"] == label) & (gdf["Edge"] >= 2) & (gdf["Edge"] < 15)]
+            results[out_key] = {
+                "double": _best_combo(sub, 2, _normalize_game_row),
+                "treble": _best_combo(sub, 3, _normalize_game_row),
+                "note": "" if not sub.empty else "No green/amber picks in this market today.",
+            }
+        else:
+            results[out_key] = {"double": None, "treble": None, "note": gnote or "No game odds available."}
+
+    pdf, pmeta, pnote = build_prop_edges(sel_date, prop_max_games)
+    quota_meta["props"] = pmeta
+    for market in ["Runs", "RBI", "Total Bases", "Home Run"]:
+        if pdf is not None and not pdf.empty:
+            sub = pdf[pdf["Market"] == market]
+            results[market] = {
+                "double": _best_combo(sub, 2, _normalize_prop_row),
+                "treble": _best_combo(sub, 3, _normalize_prop_row),
+                "note": "" if not sub.empty else "No green/amber picks in this market today.",
+            }
+        else:
+            results[market] = {"double": None, "treble": None, "note": pnote or "No prop odds available."}
+
+    return results, quota_meta
+
+
+def suggest_stakes(bankroll, markets_with_bets):
+    """Allocate a bankroll across markets by trust tier. Home Run always gets a
+    small flat 'lottery ticket' slice (capped, never more than 5% of bankroll)
+    rather than a proportional share, since it's inherently a long-shot market
+    regardless of how it's staked."""
+    stakes = {}
+    has_hr = "Home Run" in markets_with_bets
+    hr_flat = round(min(2.0, bankroll * 0.05), 2) if has_hr else 0.0
+    remaining = bankroll - hr_flat
+    other_markets = [m for m in markets_with_bets if m != "Home Run"]
+    total_weight = sum(MARKET_TRUST_TIER.get(m, 1.0) for m in other_markets)
+    if has_hr:
+        stakes["Home Run"] = hr_flat
+    for m in other_markets:
+        w = MARKET_TRUST_TIER.get(m, 1.0)
+        stakes[m] = round(remaining * w / total_weight, 2) if total_weight > 0 else 0.0
+    return stakes
+
+
+
 def build_most_likely(sel_date, max_games=15):
     """Rank batters by the model's raw probability of recording >=1 of each prop
     market (no odds, no quota), using confirmed lineups, opposing starter and park."""
@@ -1161,7 +1356,7 @@ def build_most_likely(sel_date, max_games=15):
             lu = fetch_live_lineups(int(gm.get("gamePk")))
         except Exception:
             lu = {}
-        gl = f"{TEAM_ABBR.get(aid, gm.get('away_team'))} @ {TEAM_ABBR.get(hid, gm.get('home_team'))}"
+        gl = f"{TEAM_ABBR.get(aid, gm.get('away_team'))} @ {TEAM_ABBR.get(hid, gm.get('home_team'))}{_dh_suffix(gm)}"
         start = gm.get("game_time_bst", "")
         had = False
         for side, opp_sp in (("home", away_sp), ("away", home_sp)):
