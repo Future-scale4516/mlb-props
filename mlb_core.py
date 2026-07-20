@@ -760,14 +760,17 @@ def build_game_edges(sel_date):
 
         home_era = home_sp.get("era", 4.5)
         away_era = away_sp.get("era", 4.5)
+        gpk = gm.get("gamePk")
         fh, fa = devig_two(cons["ml_home"], cons["ml_away"])
         if fh is not None:
             e, v = edge_ev(mdl["p_home_ml"], fh, cons["ml_home_best"])
             rows.append([gl, "Moneyline", home, mdl["p_home_ml"], fh, e, cons["ml_home_best"], v,
-                         _ml_rl_reason(home_rpg, away_rpg, home_era, away_era, away_bp)])
+                         _ml_rl_reason(home_rpg, away_rpg, home_era, away_era, away_bp),
+                         gpk, "home", None, None])
             e, v = edge_ev(mdl["p_away_ml"], fa, cons["ml_away_best"])
             rows.append([gl, "Moneyline", away, mdl["p_away_ml"], fa, e, cons["ml_away_best"], v,
-                         _ml_rl_reason(away_rpg, home_rpg, away_era, home_era, home_bp)])
+                         _ml_rl_reason(away_rpg, home_rpg, away_era, home_era, home_bp),
+                         gpk, "away", None, None])
         frh, fra = devig_two(cons["rl_home"], cons["rl_away"])
         # The model only ever computes "win by 2+ runs" (a 1.5-run margin) — only
         # show Run Line when that's genuinely the line being priced, so a "-1.5"/
@@ -777,26 +780,31 @@ def build_game_edges(sel_date):
         if frh is not None and rl_is_standard:
             e, v = edge_ev(mdl["p_home_cover"], frh, cons["rl_home_best"])
             rows.append([gl, "Run line", f"{home} -1.5", mdl["p_home_cover"], frh, e, cons["rl_home_best"], v,
-                         _ml_rl_reason(home_rpg, away_rpg, home_era, away_era, away_bp)])
+                         _ml_rl_reason(home_rpg, away_rpg, home_era, away_era, away_bp),
+                         gpk, "home", 1.5, None])
             e, v = edge_ev(mdl["p_away_cover"], fra, cons["rl_away_best"])
             rows.append([gl, "Run line", f"{away} +1.5", mdl["p_away_cover"], fra, e, cons["rl_away_best"], v,
-                         _ml_rl_reason(away_rpg, home_rpg, away_era, home_era, home_bp)])
+                         _ml_rl_reason(away_rpg, home_rpg, away_era, home_era, home_bp),
+                         gpk, "away", 1.5, None])
         fo, fu = devig_two(cons["over"], cons["under"])
         if fo is not None and cons["total_line"] is not None:
             ln = cons["total_line"]
             e, v = edge_ev(mdl["p_over"], fo, cons["over_best"])
             rows.append([gl, "Total", f"Over {ln}", mdl["p_over"], fo, e, cons["over_best"], v,
                          _total_reason(home_rpg, away_rpg, home_era, away_era, pf, "Over",
-                                       home_bp, away_bp)])
+                                       home_bp, away_bp),
+                         gpk, None, ln, "Over"])
             e, v = edge_ev(mdl["p_under"], fu, cons["under_best"])
             rows.append([gl, "Total", f"Under {ln}", mdl["p_under"], fu, e, cons["under_best"], v,
                          _total_reason(home_rpg, away_rpg, home_era, away_era, pf, "Under",
-                                       home_bp, away_bp)])
+                                       home_bp, away_bp),
+                         gpk, None, ln, "Under"])
 
     if not rows:
         return None, "No matched games with usable odds.", meta
     df = pd.DataFrame(rows, columns=["Game", "Market", "Selection",
-                                     "Model %", "Fair %", "Edge", "Odds", "EV %", "Reason"])
+                                     "Model %", "Fair %", "Edge", "Odds", "EV %", "Reason",
+                                     "GamePk", "Side", "Threshold", "Direction"])
     df["Model %"] = (df["Model %"] * 100).round(1)
     df["Fair %"] = (df["Fair %"] * 100).round(1)
     df["Edge"] = df["Edge"].round(1)
@@ -1130,7 +1138,8 @@ def build_prop_edges(sel_date, max_games=6):
              "batter_rbis": "RBI", "batter_runs_scored": "Runs",
              "batter_total_bases": "Total Bases"}
     cols = ["Market", "Light", "Player", "Game", "Start", "Line",
-            "Model %", "Market %", "Edge", "Best over", "Reason"]
+            "Model %", "Market %", "Edge", "Best over", "Reason",
+            "GamePk", "PlayerID", "MarketKey", "Point"]
     rows, unmatched = [], []
     analysed, last_meta = 0, meta
 
@@ -1216,7 +1225,8 @@ def build_prop_edges(sel_date, max_games=6):
                 rows.append([LABEL[mkey], _edge_light(edge), player, gl, start, f"O{od['point']}",
                              round(mp * 100, 1), round(bp * 100, 1), round(edge, 1),
                              od["over_best"], _prop_reason(mkey, srow, opp_hr9, opp_k9, park,
-                                                            order, ahead_obp, behind_slg)])
+                                                            order, ahead_obp, behind_slg),
+                             gm.get("gamePk"), pid, mkey, od["point"]])
 
     note = f"Analysed {analysed} game(s)."
     if unmatched:
@@ -1237,13 +1247,19 @@ MARKET_TRUST_TIER = {
 
 def _normalize_game_row(row):
     return {"label": row["Selection"], "game": row["Game"], "odds": float(row["Odds"]),
-            "model_pct": float(row["Model %"]), "reason": row.get("Reason", "")}
+            "model_pct": float(row["Model %"]), "reason": row.get("Reason", ""),
+            "kind": "game", "market": row["Market"], "game_pk": row.get("GamePk"),
+            "side": row.get("Side"), "threshold": row.get("Threshold"),
+            "direction": row.get("Direction")}
 
 
 def _normalize_prop_row(row):
     return {"label": f"{row['Player']} {row['Line']}", "game": row["Game"],
             "odds": float(row["Best over"]), "model_pct": float(row["Model %"]),
-            "reason": row.get("Reason", "")}
+            "reason": row.get("Reason", ""),
+            "kind": "prop", "market": row["Market"], "game_pk": row.get("GamePk"),
+            "player_id": row.get("PlayerID"), "market_key": row.get("MarketKey"),
+            "point": row.get("Point")}
 
 
 def _best_combo(candidates, n_legs, normalize_fn):
@@ -1468,13 +1484,10 @@ def run_backtest(sel_date, days_back=14):
     return recs, days_done
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_boxscore_batters(game_pk):
-    """Actual batter box-score lines (hits, HR, RBI, runs, batting order) for a
-    completed game. Free MLB data, used to score the prop model in the backtest."""
-    if not game_pk:
-        return []
-    data = safe_get(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore")
+def _parse_boxscore_batters(data):
+    """Shared parsing logic for boxscore batter data — used by both the long-TTL
+    backtest version (finished games only) and the short-TTL live-check version
+    (a game still in progress, where stats change inning to inning)."""
     out = []
     for side in ("home", "away"):
         team = data.get("teams", {}).get(side, {})
@@ -1502,6 +1515,137 @@ def fetch_boxscore_batters(game_pk):
                 "total_bases": int(bat.get("totalBases") or 0),
             })
     return out
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_boxscore_batters(game_pk):
+    """Actual batter box-score lines (hits, HR, RBI, runs, batting order) for a
+    completed game. Free MLB data, used to score the prop model in the backtest.
+    Long TTL is fine here since backtests only ever look at already-finished games."""
+    if not game_pk:
+        return []
+    data = safe_get(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore")
+    return _parse_boxscore_batters(data)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_boxscore_batters_live(game_pk):
+    """Same data as fetch_boxscore_batters but with a short TTL, for checking a
+    batter's CURRENT stat line during a game still in progress — the long-TTL
+    version would otherwise serve a stale snapshot for the rest of the game."""
+    if not game_pk:
+        return []
+    data = safe_get(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore")
+    return _parse_boxscore_batters(data)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_live_game_state(game_pk):
+    """Current score/state for a single game — works whether it hasn't started,
+    is in progress, or has finished. Short TTL so re-checking mid-game is fresh."""
+    if not game_pk:
+        return {"status": "Unknown", "home_runs": None, "away_runs": None}
+    data = safe_get(f"https://statsapi.mlb.com/api/v1.1/game/{int(game_pk)}/feed/live")
+    game_state = data.get("gameData", {}).get("status", {}).get("abstractGameState", "Preview")
+    linescore = data.get("liveData", {}).get("linescore", {})
+    teams = linescore.get("teams", {})
+    return {
+        "status": game_state,  # "Preview" | "Live" | "Final"
+        "home_runs": teams.get("home", {}).get("runs"),
+        "away_runs": teams.get("away", {}).get("runs"),
+        "inning": linescore.get("currentInning"),
+        "inning_state": linescore.get("inningState", ""),
+    }
+
+
+_PROP_STAT_KEY = {"batter_home_runs": "hr", "batter_hits": "hits", "batter_rbis": "rbi",
+                  "batter_runs_scored": "runs", "batter_total_bases": "total_bases"}
+
+
+def evaluate_leg_status(leg):
+    """Check a single suggested-bet leg against live/final MLB data. Returns
+    (status, detail) where status is one of: 'pending' (game not started),
+    'winning'/'losing' (live, currently on/off track), 'won'/'lost' (final),
+    or 'unknown' (couldn't determine — e.g. a push, or data unavailable)."""
+    gpk = leg.get("game_pk")
+    if not gpk:
+        return "unknown", "No game data available for this leg."
+    state = fetch_live_game_state(gpk)
+    game_status = state.get("status", "Preview")
+    if game_status == "Preview":
+        return "pending", "Game hasn't started yet."
+
+    if leg["kind"] == "game":
+        hr, ar = state.get("home_runs"), state.get("away_runs")
+        if hr is None or ar is None:
+            return "unknown", "Live score unavailable."
+        market = leg["market"]
+        if market == "Moneyline":
+            side = leg["side"]
+            team_r = hr if side == "home" else ar
+            opp_r = ar if side == "home" else hr
+            tied = team_r == opp_r
+            ahead = team_r > opp_r
+        elif market == "Run Line":
+            side = leg["side"]
+            margin = leg.get("threshold") or 1.5
+            team_r = hr if side == "home" else ar
+            opp_r = ar if side == "home" else hr
+            diff = team_r - opp_r
+            ahead = diff >= margin if side == "home" else diff > -margin
+            tied = False
+        elif market == "Totals":
+            total = hr + ar
+            line = leg.get("threshold")
+            direction = leg.get("direction")
+            ahead = total > line if direction == "Over" else total < line
+            tied = total == line
+        else:
+            return "unknown", "Unrecognized market for live checking."
+
+        if game_status == "Final":
+            if tied:
+                return "unknown", f"Final {ar}-{hr} — push or unusual result, check manually."
+            return ("won" if ahead else "lost"), f"Final score: {ar} away, {hr} home."
+        return ("winning" if ahead else "losing"), \
+               f"Live: {ar} away, {hr} home (inning {state.get('inning')})."
+
+    # prop leg
+    pid = leg.get("player_id")
+    mkey = leg.get("market_key")
+    point = leg.get("point")
+    if not pid or not mkey or point is None:
+        return "unknown", "Missing player/market data for this leg."
+    box = fetch_boxscore_batters_live(int(gpk)) if game_status != "Final" \
+        else fetch_boxscore_batters(int(gpk))
+    player_row = next((b for b in box if b.get("player_id") == pid), None)
+    if player_row is None:
+        return "pending", "Not in the box score yet — hasn't batted, or not starting."
+    actual = player_row.get(_PROP_STAT_KEY.get(mkey), 0)
+    ahead = actual > point
+    if game_status == "Final":
+        return ("won" if ahead else "lost"), f"Final: {actual} (needed more than {point})."
+    return ("winning" if ahead else "losing"), f"So far: {actual} (needed more than {point})."
+
+
+def evaluate_combo_status(combo):
+    """Overall verdict for a combo: one lost leg kills the whole thing regardless
+    of the others; all legs won means the combo won; otherwise it's still alive
+    (a mix of pending/winning/won legs), unless something couldn't be determined."""
+    leg_results = [evaluate_leg_status(leg) for leg in combo["legs"]]
+    statuses = [s for s, _ in leg_results]
+    if "lost" in statuses:
+        overall = "lost"
+    elif all(s == "won" for s in statuses):
+        overall = "won"
+    elif "unknown" in statuses:
+        overall = "unknown"
+    else:
+        overall = "alive"
+    return overall, leg_results
+
+
+
 
 
 def run_prop_backtest(sel_date, days_back=14, max_games_per_day=None):
