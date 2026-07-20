@@ -24,10 +24,24 @@ with col2:
 st.caption(f"Projected prop-scan cost: up to {prop_games * 4} credits. Game-line scan is "
            "quota-light. Cached 15 min, so re-running with the same date/game count is free.")
 
+MARKET_ORDER = ["Moneyline", "Run Line", "Totals", "Runs", "RBI", "Total Bases", "Home Run"]
+STATUS_BADGE = {"pending": "⏳ Pending", "winning": "🟢 Winning", "losing": "🔴 Losing",
+                "won": "✅ Won", "lost": "❌ Lost", "unknown": "❓ Unknown"}
+COMBO_BADGE = {"alive": "🟢 Still alive", "won": "✅ Combo won!",
+               "lost": "❌ Combo lost", "unknown": "❓ Uncertain — check manually"}
+
 if st.button("Build suggested bets"):
     with st.spinner("Scanning every market and building combos..."):
         results, quota_meta = build_suggested_bets(sel_date, prop_games)
+    st.session_state["suggested_results"] = results
+    st.session_state["suggested_bankroll"] = bankroll
+    st.session_state["suggested_quota_meta"] = quota_meta
+    st.session_state.pop("suggested_live_status", None)  # clear any stale live check
 
+if "suggested_results" in st.session_state:
+    results = st.session_state["suggested_results"]
+    bankroll_used = st.session_state.get("suggested_bankroll", bankroll)
+    quota_meta = st.session_state.get("suggested_quota_meta", {})
     available_markets = [mk for mk, r in results.items() if r["double"] or r["treble"]]
     pmeta = quota_meta.get("props", {})
     if pmeta.get("remaining"):
@@ -37,8 +51,26 @@ if st.button("Build suggested bets"):
         st.warning("No markets have enough qualifying picks right now. Try again closer to "
                    "first pitch, or once lineups/odds are posted.")
     else:
-        stakes = suggest_stakes(bankroll, available_markets)
-        MARKET_ORDER = ["Moneyline", "Run Line", "Totals", "Runs", "RBI", "Total Bases", "Home Run"]
+        stakes = suggest_stakes(bankroll_used, available_markets)
+
+        live_col1, live_col2 = st.columns([2, 3])
+        with live_col1:
+            check_live = st.button("🔴 Check live status")
+        with live_col2:
+            st.caption("Checks today's games right now — pending, live winning/losing, or "
+                       "already won/lost. One lost leg kills the whole combo, same as a "
+                       "real bet. Re-click any time during the day for an updated read.")
+        if check_live:
+            with st.spinner("Checking live scores and box scores..."):
+                live_status = {}
+                for market, r in results.items():
+                    live_status[market] = {}
+                    for combo_type in ("double", "treble"):
+                        combo = r.get(combo_type)
+                        if combo:
+                            live_status[market][combo_type] = evaluate_combo_status(combo)
+            st.session_state["suggested_live_status"] = live_status
+        live_status = st.session_state.get("suggested_live_status")
 
         for market in MARKET_ORDER:
             r = results.get(market)
@@ -63,11 +95,21 @@ if st.button("Build suggested bets"):
                     if combo is None:
                         st.caption("Not enough distinct-game picks available for this size.")
                         continue
-                    for leg in combo["legs"]:
+
+                    leg_live = None
+                    if live_status and market in live_status and combo_type in live_status[market]:
+                        overall, leg_live = live_status[market][combo_type]
+                        st.markdown(f"**{COMBO_BADGE.get(overall, overall)}**")
+
+                    for i, leg in enumerate(combo["legs"]):
                         st.write(f"• **{leg['label']}** ({leg['game']}) @ {leg['odds']:.2f} "
                                  f"— {leg['model_pct']:.1f}% model")
                         if leg.get("reason"):
                             st.caption(leg["reason"])
+                        if leg_live:
+                            status, detail = leg_live[i]
+                            st.caption(f"{STATUS_BADGE.get(status, status)} — {detail}")
+
                     mc1, mc2 = st.columns(2)
                     mc1.metric("Combined odds", f"{combo['combined_odds']:.2f}")
                     mc2.metric("Chance to land", f"{combo['combined_prob']*100:.1f}%")
@@ -80,5 +122,6 @@ if st.button("Build suggested bets"):
                    "doesn't know about doubleheader game numbers when picking legs across "
                    "markets, so if two suggested legs land on the same day for the same "
                    "teams, double-check which specific game (1)/(2) each one refers to. "
-                   "Model is a work in progress — treat suggestions as a starting point for "
-                   "your own judgement, not a guarantee.")
+                   "Live status is a same-day read only — nothing here is saved between "
+                   "visits. Model is a work in progress — treat suggestions as a starting "
+                   "point for your own judgement, not a guarantee.")
