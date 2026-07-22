@@ -27,12 +27,13 @@ if st.button("Load today's picks"):
 
     rows = []
 
-    # Game-line edges — pull green + amber (2–15 pts)
+    # Game-line edges — pull green + amber (band varies slightly by market)
     if isinstance(gdf, pd.DataFrame) and not gdf.empty:
         for _, r in gdf.iterrows():
-            if 2 <= r["Edge"] < 15:
+            _lo, _mid, _hi = MARKET_EDGE_BANDS.get(r["Market"], (2, 8, 15))
+            if _lo <= r["Edge"] < _hi:
                 rows.append({
-                    "Light": _edge_light(r["Edge"]),
+                    "Light": classify_pick(r["Edge"], r["Model %"], r["Market"]),
                     "Type": "Game",
                     "Market": r["Market"],
                     "Selection": r["Selection"],
