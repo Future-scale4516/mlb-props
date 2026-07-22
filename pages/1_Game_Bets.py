@@ -53,7 +53,8 @@ if st.button("Analyse game bets (UK odds)"):
                     st.write("No odds available for this market today.")
                     return
                 sub = sub.copy()
-                sub.insert(0, "🚦", sub["Edge"].apply(_edge_light))
+                sub.insert(0, "🚦", sub.apply(
+                    lambda r: classify_pick(r["Edge"], r["Model %"], market_name), axis=1))
                 disp = sub[["🚦", "Start", "US Date", "Game", "Selection",
                             "Model %", "Fair %", "Edge", "Odds", "EV %", "Reason"]]
                 st.dataframe(disp, use_container_width=True, hide_index=True,
@@ -100,10 +101,13 @@ if st.button("Analyse game bets (UK odds)"):
 
 if isinstance(st.session_state.get("game_edges"), pd.DataFrame) and not st.session_state["game_edges"].empty:
     _ge = st.session_state["game_edges"]
-    _greens = _ge[(_ge["Edge"] >= 2) & (_ge["Edge"] < 8)].copy()
+    _greens = _ge[_ge.apply(
+        lambda r: MARKET_EDGE_BANDS.get(r["Market"], (2, 8, 15))[0] <= r["Edge"]
+                  < MARKET_EDGE_BANDS.get(r["Market"], (2, 8, 15))[1], axis=1)].copy()
     st.markdown("### 🎟️ Accumulator builder")
-    st.caption("Builds a multi-fold from 🟢 green selections only (believable 2–8 pt edges) — "
-               "ambers and reds are deliberately excluded. Combined odds and the model's "
+    st.caption("Builds a multi-fold from 🟢 green selections only — ambers and reds are "
+               "deliberately excluded. Green's edge range varies slightly by market (see "
+               "the traffic-light explanation above). Combined odds and the model's "
                "probability of the whole bet landing are worked out for you.")
     if _greens.empty:
         st.write("No green selections on the analysed slate to build an accumulator from.")
@@ -141,7 +145,8 @@ if isinstance(st.session_state.get("game_edges"), pd.DataFrame) and not st.sessi
                            "). Those outcomes are correlated, so the combined chance above "
                            "is optimistic and most bookmakers need a 'same-game multi' "
                            "rather than a standard accumulator.")
-            _sel.insert(0, "🚦", _sel["Edge"].apply(_edge_light))
+            _sel.insert(0, "🚦", _sel.apply(
+                lambda r: classify_pick(r["Edge"], r["Model %"], r["Market"]), axis=1))
             st.dataframe(_sel[["🚦", "Game", "Selection", "Market", "Model %", "Fair %",
                                "Edge", "Odds", "Reason"]], use_container_width=True, hide_index=True,
                          column_config={"🚦": st.column_config.TextColumn("", width="small"),
