@@ -62,17 +62,8 @@ if st.button("Find player prop edges (US books)"):
             ng = int((prop_df["Edge"] < 8).sum())
             na = int((prop_df["Edge"] >= 8).sum())
             st.markdown(f"### 🟢 {ng} green · 🟡 {na} amber value props")
-            pcfg = {
-                "Light": st.column_config.TextColumn("", width="small"),
-                "Player": st.column_config.TextColumn("Player", width="large"),
-                "Game": st.column_config.TextColumn("Game", width="small"),
-                "Start": st.column_config.TextColumn("Start", width="small"),
-                "Model %": st.column_config.NumberColumn("Model %", format="%.1f"),
-                "Market %": st.column_config.NumberColumn("Market %", format="%.1f"),
-                "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f"),
-                "Best over": st.column_config.NumberColumn("Best over", format="%.2f"),
-                "Reason": st.column_config.TextColumn("Why it's green/amber", width="large"),
-            }
+            prop_df = prop_df.copy()
+            prop_df["Game"] = prop_df["Game"] + " · " + prop_df["Start"]
 
             def show_prop_market(tab, label):
                 with tab:
@@ -81,10 +72,14 @@ if st.button("Find player prop edges (US books)"):
                     if sub.empty:
                         st.write("No value bets in this market today.")
                         return
-                    disp = sub[["Light", "Player", "Game", "Start", "Line", "Model %",
-                                "Market %", "Edge", "Best over", "Reason"]]
-                    st.dataframe(disp, use_container_width=True, hide_index=True,
-                                 column_config=pcfg)
+                    for _, row in sub.iterrows():
+                        render_pick_card(
+                            row["Light"], f"{row['Player']} {row['Line']}", row["Game"],
+                            [("Model %", f"{row['Model %']:.1f}%"),
+                             ("Market %", f"{row['Market %']:.1f}%"),
+                             ("Edge", f"{row['Edge']:.1f} pts"),
+                             ("Odds", f"{row['Best over']:.2f}")],
+                            reason=row["Reason"])
 
             hr_t, hit_t, rbi_t, run_t, tb_t = st.tabs(
                 ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs", "📦 Total Bases"])
@@ -111,21 +106,8 @@ if st.button("Rank most likely hitters"):
         st.warning(ml_note)
     else:
         st.caption(ml_note)
-        mlcfg_pct = {
-            "Player": st.column_config.TextColumn("Player", width="large"),
-            "Game": st.column_config.TextColumn("Game", width="small"),
-            "Start": st.column_config.TextColumn("Start", width="small"),
-            "Order": st.column_config.NumberColumn("Slot", format="%d"),
-            "Value": st.column_config.ProgressColumn("Model prob %", min_value=0,
-                                                     max_value=100, format="%.1f"),
-        }
-        mlcfg_tb = {
-            "Player": st.column_config.TextColumn("Player", width="large"),
-            "Game": st.column_config.TextColumn("Game", width="small"),
-            "Start": st.column_config.TextColumn("Start", width="small"),
-            "Order": st.column_config.NumberColumn("Slot", format="%d"),
-            "Value": st.column_config.NumberColumn("Expected TB", format="%.2f"),
-        }
+        ml_df = ml_df.copy()
+        ml_df["Game"] = ml_df["Game"] + " · " + ml_df["Start"]
 
         def show_ml(tab, label, is_tb=False):
             with tab:
@@ -134,9 +116,12 @@ if st.button("Rank most likely hitters"):
                 if sub.empty:
                     st.write("No ranked batters for this market.")
                     return
-                st.dataframe(sub[["Player", "Game", "Start", "Order", "Value"]].head(40),
-                             use_container_width=True, hide_index=True,
-                             column_config=(mlcfg_tb if is_tb else mlcfg_pct))
+                for _, row in sub.head(40).iterrows():
+                    value_label = "Expected TB" if is_tb else "Model prob %"
+                    value_str = f"{row['Value']:.2f}" if is_tb else f"{row['Value']:.1f}%"
+                    render_pick_card(
+                        None, row["Player"], f"{row['Game']} · Slot #{int(row['Order'])}",
+                        [(value_label, value_str)])
 
         ml_hr, ml_hit, ml_rbi, ml_run, ml_combo, ml_tb = st.tabs(
             ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs", "🎰 Runs+Hits+RBI", "📦 Total Bases"])
