@@ -67,11 +67,15 @@ if st.button("Find player prop edges (US books)"):
 
             def show_prop_market(tab, label):
                 with tab:
-                    sub = prop_df[prop_df["Market"] == label].sort_values(
-                        "Edge", ascending=False).reset_index(drop=True)
+                    sub = prop_df[prop_df["Market"] == label].copy()
                     if sub.empty:
                         st.write("No value bets in this market today.")
                         return
+                    sub = sort_picker(sub, [
+                        ("Edge (high to low)", "Edge", False),
+                        ("Model % (high to low)", "Model %", False),
+                        ("Odds (high to low)", "Best over", False),
+                    ], key=f"sort_prop_{label}")
                     for _, row in sub.iterrows():
                         render_pick_card(
                             row["Light"], f"{row['Player']} {row['Line']}", row["Game"],
@@ -111,13 +115,16 @@ if st.button("Rank most likely hitters"):
 
         def show_ml(tab, label, is_tb=False):
             with tab:
-                sub = ml_df[ml_df["Market"] == label].sort_values(
-                    "Value", ascending=False).reset_index(drop=True)
+                sub = ml_df[ml_df["Market"] == label].copy()
                 if sub.empty:
                     st.write("No ranked batters for this market.")
                     return
+                value_label = "Expected TB" if is_tb else "Model prob %"
+                sub = sort_picker(sub, [
+                    (f"{value_label} (high to low)", "Value", False),
+                    ("Batting slot (low to high)", "Order", True),
+                ], key=f"sort_ml_{label}")
                 for _, row in sub.head(40).iterrows():
-                    value_label = "Expected TB" if is_tb else "Model prob %"
                     value_str = f"{row['Value']:.2f}" if is_tb else f"{row['Value']:.1f}%"
                     render_pick_card(
                         None, row["Player"], f"{row['Game']} · Slot #{int(row['Order'])}",
