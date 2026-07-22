@@ -681,22 +681,34 @@ def _dh_suffix(gm):
 
 
 def render_pick_card(light, title, subtitle, metrics, reason=None):
-    """Render one betting pick as a mobile-friendly card instead of a wide table
-    row — a light+title header, a compact metrics strip, and an optional reason
-    caption underneath. `metrics` is a list of (label, value_str) tuples shown
-    side by side. Everything here stacks vertically, so it avoids the
-    horizontal-scroll problem st.dataframe has on narrow phone screens — the
-    trade-off is it takes more vertical space per pick than a table row does."""
+    """Render one betting pick as a compact, mobile-friendly card instead of a
+    wide table row — a light+title header, one dense line of metrics, and an
+    optional reason caption underneath. `metrics` is a list of (label, value)
+    tuples joined into a single small-text line — deliberately NOT one
+    st.metric widget per value, since those are large KPI-style displays by
+    design and were the main driver of how much vertical space each card took.
+    Everything stacks vertically, avoiding the horizontal-scroll problem
+    st.dataframe has on narrow phone screens."""
     with st.container(border=True):
         header = f"{light} **{title}**" if light else f"**{title}**"
         st.markdown(header)
         if subtitle:
             st.caption(subtitle)
-        cols = st.columns(len(metrics))
-        for col, (label, value) in zip(cols, metrics):
-            col.metric(label, value)
+        st.caption("  ·  ".join(f"{label}: {value}" for label, value in metrics))
         if reason:
             st.caption(reason)
+
+
+def sort_picker(df, sort_options, key):
+    """Show a small selectbox letting the user choose how a card list is
+    sorted, then return the dataframe sorted accordingly. sort_options is a
+    list of (label, column, ascending) tuples; the first one is the default —
+    this replaces the click-a-column-header sorting st.dataframe gave for free,
+    which cards don't have since they're not a grid."""
+    labels = [lbl for lbl, _, _ in sort_options]
+    choice = st.selectbox("Sort by", labels, key=key)
+    _, col, asc = next(o for o in sort_options if o[0] == choice)
+    return df.sort_values(col, ascending=asc).reset_index(drop=True)
 
 
 def _ml_rl_reason(team_rpg, opp_rpg, team_era, opp_era, opp_bullpen_era=None,
