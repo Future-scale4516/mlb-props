@@ -24,26 +24,16 @@ if st.button("Analyse game bets (UK odds)"):
                        f"remaining {gmeta.get('remaining')}")
         if gnote:
             st.info(gnote)
-        green = int(((gdf["Edge"] >= 2) & (gdf["Edge"] < 8)).sum())
-        amber = int(((gdf["Edge"] >= 8) & (gdf["Edge"] < 15)).sum())
-        red = int((gdf["Edge"] >= 15).sum())
+        _lights = gdf.apply(lambda r: classify_pick(r["Edge"], r["Model %"], r["Market"]), axis=1)
+        green = int((_lights == "🟢").sum())
+        amber = int((_lights == "🟡").sum())
+        red = int((_lights == "🔴").sum())
         st.markdown(f"### 🟢 {green} green · 🟡 {amber} amber · 🔴 {red} red")
         st.caption("🟢 2–8 pts = believable value · 🟡 8–15 = treat with caution · "
                    "🔴 15+ = almost certainly a missing model input, not a real edge · "
-                   "⚪ under 2 = no signal.")
-        cfg = {
-            "🚦": st.column_config.TextColumn("", width="small"),
-            "Start": st.column_config.TextColumn("Start (BST)", width="small"),
-            "US Date": st.column_config.TextColumn("US Date", width="small"),
-            "Game": st.column_config.TextColumn("Game", width="small"),
-            "Selection": st.column_config.TextColumn("Selection", width="large"),
-            "Model %": st.column_config.NumberColumn("Model %", format="%.1f"),
-            "Fair %": st.column_config.NumberColumn("Fair %", format="%.1f"),
-            "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f"),
-            "Odds": st.column_config.NumberColumn("Best odds", format="%.2f"),
-            "EV %": st.column_config.NumberColumn("EV %", format="%.1f"),
-            "Reason": st.column_config.TextColumn("Why it's a pick", width="large"),
-        }
+                   "⚪ under 2 = no signal. A suspiciously high raw model probability is "
+                   "also flagged red on its own, even with a small edge. (Player props like "
+                   "Runs/RBI/Total Bases use slightly wider bands — see the Player Props page.)")
 
         def show_market(tab, market_name):
             with tab:
@@ -53,12 +43,16 @@ if st.button("Analyse game bets (UK odds)"):
                     st.write("No odds available for this market today.")
                     return
                 sub = sub.copy()
-                sub.insert(0, "🚦", sub.apply(
-                    lambda r: classify_pick(r["Edge"], r["Model %"], market_name), axis=1))
-                disp = sub[["🚦", "Start", "US Date", "Game", "Selection",
-                            "Model %", "Fair %", "Edge", "Odds", "EV %", "Reason"]]
-                st.dataframe(disp, use_container_width=True, hide_index=True,
-                             column_config=cfg)
+                for _, row in sub.iterrows():
+                    light = classify_pick(row["Edge"], row["Model %"], market_name)
+                    render_pick_card(
+                        light, f"{row['Selection']} @ {row['Odds']:.2f}",
+                        f"{row['Game']} · {row['Start']} ({row['US Date']})",
+                        [("Model %", f"{row['Model %']:.1f}%"),
+                         ("Fair %", f"{row['Fair %']:.1f}%"),
+                         ("Edge", f"{row['Edge']:.1f} pts"),
+                         ("EV %", f"{row['EV %']:.1f}%")],
+                        reason=row["Reason"])
 
         def show_most_likely(tab):
             with tab:
@@ -76,17 +70,11 @@ if st.button("Analyse game bets (UK odds)"):
                 if sub.empty:
                     st.write("No selections match the chosen markets.")
                     return
-                disp = sub[["Start", "US Date", "Game", "Market", "Selection", "Model %"]]
-                st.dataframe(disp, use_container_width=True, hide_index=True,
-                             column_config={
-                                 "Start": st.column_config.TextColumn("Start (BST)", width="small"),
-                                 "US Date": st.column_config.TextColumn("US Date", width="small"),
-                                 "Game": st.column_config.TextColumn("Game", width="small"),
-                                 "Market": st.column_config.TextColumn("Market", width="small"),
-                                 "Selection": st.column_config.TextColumn("Selection", width="large"),
-                                 "Model %": st.column_config.ProgressColumn(
-                                     "Model %", min_value=0, max_value=100, format="%.1f"),
-                             })
+                for _, row in sub.iterrows():
+                    render_pick_card(
+                        None, f"{row['Selection']} · {row['Market']}",
+                        f"{row['Game']} · {row['Start']} ({row['US Date']})",
+                        [("Model %", f"{row['Model %']:.1f}%")])
 
         ml_tab, rl_tab, tot_tab, most_likely_tab = st.tabs(
             ["💰 Money Line", "📏 Run Line", "📊 Totals", "🎯 Most Likely"])
@@ -145,14 +133,15 @@ if isinstance(st.session_state.get("game_edges"), pd.DataFrame) and not st.sessi
                            "). Those outcomes are correlated, so the combined chance above "
                            "is optimistic and most bookmakers need a 'same-game multi' "
                            "rather than a standard accumulator.")
-            _sel.insert(0, "🚦", _sel.apply(
-                lambda r: classify_pick(r["Edge"], r["Model %"], r["Market"]), axis=1))
-            st.dataframe(_sel[["🚦", "Game", "Selection", "Market", "Model %", "Fair %",
-                               "Edge", "Odds", "Reason"]], use_container_width=True, hide_index=True,
-                         column_config={"🚦": st.column_config.TextColumn("", width="small"),
-                                        "Odds": st.column_config.NumberColumn("Best odds", format="%.2f"),
-                                        "Edge": st.column_config.NumberColumn("Edge (pts)", format="%.1f"),
-                                        "Reason": st.column_config.TextColumn("Why it's a pick", width="large")})
+            for _, row in _sel.iterrows():
+                light = classify_pick(row["Edge"], row["Model %"], row["Market"])
+                render_pick_card(
+                    light, f"{row['Selection']} @ {row['Odds']:.2f}",
+                    f"{row['Game']} · {row['Market']}",
+                    [("Model %", f"{row['Model %']:.1f}%"),
+                     ("Fair %", f"{row['Fair %']:.1f}%"),
+                     ("Edge", f"{row['Edge']:.1f} pts")],
+                    reason=row["Reason"])
             st.caption("Model chance assumes legs are independent (true across different "
                        "games). A multi needs every leg to win, so it is high-variance even "
                        "when each leg has an edge — stake accordingly, and remember the model "
