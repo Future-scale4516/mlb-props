@@ -539,19 +539,62 @@ def edge_ev(model_p, fair_p, best_odds):
     return edge, ev
 
 
-def _edge_light(edge):
-    """Traffic-light banding for an edge (percentage points).
-    grey <2 (no signal) · green 2-8 (value zone) · amber 8-15 (suspect) ·
-    red 15+ (almost certainly a missing model input, not real value)."""
+MARKET_EDGE_BANDS = {
+    # (no_signal_ceiling, green_ceiling, amber_ceiling): edge below the first
+    # number is grey (no signal), between 1st-2nd is green, 2nd-3rd is amber,
+    # at/above the 3rd is red. Markets with a long, clean backtest track record
+    # (Moneyline, Run line, Total, Hits) keep the original baseline bands.
+    # Runs and Total Bases have shown real overconfidence in backtests/results
+    # even after fixes, so they need a bigger edge to earn the same colour.
+    # RBI — the weakest market even with its calibration correction — needs the
+    # biggest edge of all. Home Run keeps baseline: its trust issue isn't edge
+    # size, it's inherent rarity, which is handled separately as a flagged
+    # lottery pick rather than by tightening these bands.
+    "Moneyline": (2, 8, 15), "Run line": (2, 8, 15), "Total": (2, 8, 15),
+    "Hits": (2, 8, 15), "Home Run": (2, 8, 15),
+    "Runs": (3, 10, 18), "Total Bases": (3, 10, 18),
+    "RBI": (4, 12, 20),
+}
+
+MARKET_PROB_CEILING = {
+    # A raw model probability above this ceiling is treated as implausible for
+    # that market regardless of edge size — the same underlying problem as a
+    # huge edge (a missing/broken input), just caught via the number itself
+    # rather than the gap to market. E.g. a Moneyline pick at 95% could still
+    # show a small, "green"-looking edge if the market also prices it high —
+    # but 95% is barely ever a sane single-game probability in MLB, and the
+    # small edge wouldn't catch that on its own.
+    "Moneyline": 90, "Run line": 88, "Total": 85, "Hits": 88,
+    "Runs": 65, "RBI": 60, "Total Bases": 80, "Home Run": 20,
+}
+
+
+def _edge_light(edge, market=None):
+    """Traffic-light banding for an edge (percentage points). Uses market-
+    specific bands when a market is given; falls back to the original baseline
+    bands otherwise (kept for any caller that doesn't pass one)."""
     if edge is None:
         return ""
-    if edge >= 15:
+    lo, mid, hi = MARKET_EDGE_BANDS.get(market, (2, 8, 15))
+    if edge >= hi:
         return "🔴"
-    if edge >= 8:
+    if edge >= mid:
         return "🟡"
-    if edge >= 2:
+    if edge >= lo:
         return "🟢"
     return "⚪"
+
+
+def classify_pick(edge, model_pct, market=None):
+    """Full traffic-light classification: checks the raw model probability for
+    plausibility FIRST — a suspiciously high probability is a red flag on its
+    own, even paired with a small edge — then falls back to the market-specific
+    edge bands. This is the function every page/build should use; _edge_light
+    alone only ever sees the edge, never the raw probability."""
+    ceiling = MARKET_PROB_CEILING.get(market, 95)
+    if model_pct is not None and model_pct > ceiling:
+        return "🔴"
+    return _edge_light(edge, market)
 
 
 def _commence_to_bst(iso):
@@ -821,6 +864,10 @@ LG_HR9 = 1.15   # league avg HR allowed per 9 innings
 LG_K9 = 8.5     # league avg K per 9 innings
 LG_WHIP = 1.30  # league avg walks+hits per inning pitched
 LG_OBP_DEFAULT = 0.320  # league avg on-base %, used for "table setters ahead" context
+MIN_PA_FOR_RANKING = 30  # batters below this get excluded from prop rankings/edges —
+                          # below this, season SLG/AVG/OBP are mostly noise from a
+                          # handful of at-bats (e.g. a 2-game callup with one lucky
+                          # double looks like an elite slugger with zero real evidence)
 LG_SLG_DEFAULT = 0.400  # league avg slugging, used for "run producers behind" context
 
 
@@ -1197,6 +1244,8 @@ def build_prop_edges(sel_date, max_games=6):
                     srow = next((v for k, v in name_map.items() if k.split()[-1] == ln), None)
                 if not srow:
                     continue
+                if (srow.get("plateAppearances") or 0) < MIN_PA_FOR_RANKING:
+                    continue  # too small a sample — season rates would be mostly noise
                 pid = int(srow.get("player_id") or 0)
                 tid = int(srow.get("team_id") or 0)
                 if tid == home_id:
@@ -1220,9 +1269,12 @@ def build_prop_edges(sel_date, max_games=6):
                 if mp is None or bp is None:
                     continue
                 edge = (mp - bp) * 100
-                if not (2.0 <= edge < 15.0):
+                mkt_label = LABEL[mkey]
+                _lo, _mid, _hi = MARKET_EDGE_BANDS.get(mkt_label, (2, 8, 15))
+                if not (_lo <= edge < _hi):
                     continue
-                rows.append([LABEL[mkey], _edge_light(edge), player, gl, start, f"O{od['point']}",
+                rows.append([mkt_label, classify_pick(edge, mp * 100, mkt_label),
+                             player, gl, start, f"O{od['point']}",
                              round(mp * 100, 1), round(bp * 100, 1), round(edge, 1),
                              od["over_best"], _prop_reason(mkey, srow, opp_hr9, opp_k9, park,
                                                             order, ahead_obp, behind_slg),
@@ -1235,13 +1287,17 @@ def build_prop_edges(sel_date, max_games=6):
 
 
 MARKET_TRUST_TIER = {
-    # Relative weights for stake allocation, built from backtest history and real
-    # results: Moneyline is the best-calibrated market; Run Line and Runs are solid;
-    # Totals and Total Bases are decent but less battle-tested; RBI is the weakest
-    # even with its calibration correction. Home Run is handled separately as a
-    # small flat "lottery ticket" slice, not part of this proportional split.
-    "Moneyline": 3.0, "Run Line": 2.0, "Runs": 2.0,
-    "Totals": 1.5, "Total Bases": 1.5, "RBI": 1.0,
+    # Relative weights for stake allocation. Updated from a mix of backtest history
+    # AND real tracked results: Moneyline stays top-tier (consistently the steadiest
+    # market across real slips). Total Bases promoted after two strong real nights
+    # in a row, including harder "2+" threshold picks landing cleanly. Run Line
+    # holds steady. Runs and RBI demoted — both have shown genuine "hit and miss"
+    # nights in real tracking (RBI's historically weaker calibration, Runs' first
+    # clean 0-for-3 miss), so they get a smaller slice while that's the pattern.
+    # Totals unchanged, no strong signal either way yet. Home Run is NOT part of
+    # this proportional split — see suggest_stakes, it's a flat small lottery slice.
+    "Moneyline": 3.0, "Total Bases": 2.5, "Run Line": 2.0,
+    "Totals": 1.5, "Runs": 1.5, "RBI": 0.75,
 }
 
 
@@ -1302,7 +1358,8 @@ def build_suggested_bets(sel_date, prop_max_games=6):
     for label in ["Moneyline", "Run line", "Total"]:
         out_key = {"Moneyline": "Moneyline", "Run line": "Run Line", "Total": "Totals"}[label]
         if gdf is not None and not gdf.empty:
-            sub = gdf[(gdf["Market"] == label) & (gdf["Edge"] >= 2) & (gdf["Edge"] < 15)]
+            _lo, _mid, _hi = MARKET_EDGE_BANDS.get(label, (2, 8, 15))
+            sub = gdf[(gdf["Market"] == label) & (gdf["Edge"] >= _lo) & (gdf["Edge"] < _hi)]
             results[out_key] = {
                 "double": _best_combo(sub, 2, _normalize_game_row),
                 "treble": _best_combo(sub, 3, _normalize_game_row),
@@ -1329,12 +1386,13 @@ def build_suggested_bets(sel_date, prop_max_games=6):
 
 def suggest_stakes(bankroll, markets_with_bets):
     """Allocate a bankroll across markets by trust tier. Home Run always gets a
-    small flat 'lottery ticket' slice (capped, never more than 5% of bankroll)
-    rather than a proportional share, since it's inherently a long-shot market
-    regardless of how it's staked."""
+    flat £1 'lottery ticket' stake — deliberately NOT scaled to bankroll, since
+    it's a for-fun long shot regardless of how much you're staking overall, not
+    a market that should get proportionally more just because the bankroll is
+    bigger."""
     stakes = {}
     has_hr = "Home Run" in markets_with_bets
-    hr_flat = round(min(2.0, bankroll * 0.05), 2) if has_hr else 0.0
+    hr_flat = min(1.0, bankroll) if has_hr else 0.0
     remaining = bankroll - hr_flat
     other_markets = [m for m in markets_with_bets if m != "Home Run"]
     total_weight = sum(MARKET_TRUST_TIER.get(m, 1.0) for m in other_markets)
@@ -1394,6 +1452,8 @@ def build_most_likely(sel_date, max_games=15):
                 srow = stat_by_id.get(int(pr["player_id"]))
                 if not srow:
                     continue
+                if (srow.get("plateAppearances") or 0) < MIN_PA_FOR_RANKING:
+                    continue  # too small a sample — season rates would be mostly noise
                 order = int(pr.get("order", 5) or 5)
                 ahead_obp, behind_slg = _lineup_context(order, slot_to_pid, stat_by_id)
                 lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9, opp_whip,
