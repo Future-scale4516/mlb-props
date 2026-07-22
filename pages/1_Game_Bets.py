@@ -37,12 +37,16 @@ if st.button("Analyse game bets (UK odds)"):
 
         def show_market(tab, market_name):
             with tab:
-                sub = gdf[gdf["Market"] == market_name].sort_values(
-                    ["_ct", "Game"]).reset_index(drop=True)
+                sub = gdf[gdf["Market"] == market_name].copy()
                 if sub.empty:
                     st.write("No odds available for this market today.")
                     return
-                sub = sub.copy()
+                sub = sort_picker(sub, [
+                    ("Start time", "_ct", True),
+                    ("Edge (high to low)", "Edge", False),
+                    ("Model % (high to low)", "Model %", False),
+                    ("Odds (high to low)", "Odds", False),
+                ], key=f"sort_{market_name}")
                 for _, row in sub.iterrows():
                     light = classify_pick(row["Edge"], row["Model %"], market_name)
                     render_pick_card(
@@ -65,11 +69,14 @@ if st.button("Analyse game bets (UK odds)"):
                                           ["Moneyline", "Run line", "Total"],
                                           default=["Moneyline", "Run line", "Total"],
                                           key="ml_market_pick")
-                sub = gdf[gdf["Market"].isin(mkt_pick)].sort_values(
-                    "Model %", ascending=False).reset_index(drop=True)
+                sub = gdf[gdf["Market"].isin(mkt_pick)].copy()
                 if sub.empty:
                     st.write("No selections match the chosen markets.")
                     return
+                sub = sort_picker(sub, [
+                    ("Model % (high to low)", "Model %", False),
+                    ("Start time", "_ct", True),
+                ], key="sort_most_likely_gb")
                 for _, row in sub.iterrows():
                     render_pick_card(
                         None, f"{row['Selection']} · {row['Market']}",
