@@ -680,6 +680,25 @@ def _dh_suffix(gm):
     return f" ({gn})" if dh in ("Y", "S") and gn else ""
 
 
+def render_pick_card(light, title, subtitle, metrics, reason=None):
+    """Render one betting pick as a mobile-friendly card instead of a wide table
+    row — a light+title header, a compact metrics strip, and an optional reason
+    caption underneath. `metrics` is a list of (label, value_str) tuples shown
+    side by side. Everything here stacks vertically, so it avoids the
+    horizontal-scroll problem st.dataframe has on narrow phone screens — the
+    trade-off is it takes more vertical space per pick than a table row does."""
+    with st.container(border=True):
+        header = f"{light} **{title}**" if light else f"**{title}**"
+        st.markdown(header)
+        if subtitle:
+            st.caption(subtitle)
+        cols = st.columns(len(metrics))
+        for col, (label, value) in zip(cols, metrics):
+            col.metric(label, value)
+        if reason:
+            st.caption(reason)
+
+
 def _ml_rl_reason(team_rpg, opp_rpg, team_era, opp_era, opp_bullpen_era=None,
                    league_rpg=LEAGUE_RPG_DEFAULT, league_era=LEAGUE_ERA_DEFAULT,
                    league_bullpen_era=LEAGUE_BULLPEN_ERA_DEFAULT):
