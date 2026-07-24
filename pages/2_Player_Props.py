@@ -50,52 +50,68 @@ if st.button("Find player prop edges (US books)"):
         prop_df, prop_meta, prop_note = build_prop_edges(sel_date, prop_max_games)
     if prop_df is None:
         st.warning(prop_note)
+        st.session_state.pop("prop_edges", None)
     else:
-        if prop_meta.get("remaining"):
-            st.caption(f"Quota — used {prop_meta.get('used')}, "
-                       f"remaining {prop_meta.get('remaining')}")
-        if prop_note:
-            st.info(prop_note)
-        if prop_df.empty:
-            st.write("No green/amber prop edges found in the analysed games.")
-        else:
-            ng = int((prop_df["Edge"] < 8).sum())
-            na = int((prop_df["Edge"] >= 8).sum())
-            st.markdown(f"### 🟢 {ng} green · 🟡 {na} amber value props")
-            prop_df = prop_df.copy()
+        # Fetch + store only; nothing below here reads live widget state, so it's
+        # safe to run only on the real button click. Display lives in the block
+        # below, which is NOT nested under this `if` — a "Sort by" change triggers
+        # its own rerun where st.button() is False again, and anything nested
+        # under this `if` (including a selectbox) would silently stop rendering.
+        prop_df = prop_df.copy()
+        if not prop_df.empty:
             prop_df["Game"] = prop_df["Game"] + " · " + prop_df["Start"]
+        st.session_state["prop_edges"] = prop_df
+        st.session_state["prop_edges_meta"] = prop_meta
+        st.session_state["prop_edges_note"] = prop_note
 
-            def show_prop_market(tab, label):
-                with tab:
-                    sub = prop_df[prop_df["Market"] == label].copy()
-                    if sub.empty:
-                        st.write("No value bets in this market today.")
-                        return
-                    sub = sort_picker(sub, [
-                        ("Edge (high to low)", "Edge", False),
-                        ("Model % (high to low)", "Model %", False),
-                        ("Odds (high to low)", "Best over", False),
-                    ], key=f"sort_prop_{label}")
-                    for _, row in sub.iterrows():
-                        render_pick_card(
-                            row["Light"], f"{row['Player']} {row['Line']}", row["Game"],
-                            [("Model %", f"{row['Model %']:.1f}%"),
-                             ("Market %", f"{row['Market %']:.1f}%"),
-                             ("Edge", f"{row['Edge']:.1f} pts"),
-                             ("Odds", f"{row['Best over']:.2f}")],
-                            reason=row["Reason"])
+if isinstance(st.session_state.get("prop_edges"), pd.DataFrame):
+    prop_df = st.session_state["prop_edges"]
+    prop_meta = st.session_state.get("prop_edges_meta") or {}
+    prop_note = st.session_state.get("prop_edges_note")
 
-            hr_t, hit_t, rbi_t, run_t, tb_t = st.tabs(
-                ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs", "📦 Total Bases"])
-            show_prop_market(hr_t, "Home Run")
-            show_prop_market(hit_t, "Hits")
-            show_prop_market(rbi_t, "RBI")
-            show_prop_market(run_t, "Runs")
-            show_prop_market(tb_t, "Total Bases")
-            st.caption("🟢 edge 2–8 · 🟡 8–15. Reds (15+) and no-signal (<2) are hidden. "
-                       "Model %: our probability · Market %: de-vigged book probability · "
-                       "Best over: best decimal price across US books. The model is still "
-                       "uncalibrated — paper-trade until it's backtested.")
+    if prop_meta.get("remaining"):
+        st.caption(f"Quota — used {prop_meta.get('used')}, "
+                   f"remaining {prop_meta.get('remaining')}")
+    if prop_note:
+        st.info(prop_note)
+    if prop_df.empty:
+        st.write("No green/amber prop edges found in the analysed games.")
+    else:
+        ng = int((prop_df["Edge"] < 8).sum())
+        na = int((prop_df["Edge"] >= 8).sum())
+        st.markdown(f"### 🟢 {ng} green · 🟡 {na} amber value props")
+
+        def show_prop_market(tab, label):
+            with tab:
+                sub = prop_df[prop_df["Market"] == label].copy()
+                if sub.empty:
+                    st.write("No value bets in this market today.")
+                    return
+                sub = sort_picker(sub, [
+                    ("Edge (high to low)", "Edge", False),
+                    ("Model % (high to low)", "Model %", False),
+                    ("Odds (high to low)", "Best over", False),
+                ], key=f"sort_prop_{label}")
+                for _, row in sub.iterrows():
+                    render_pick_card(
+                        row["Light"], f"{row['Player']} {row['Line']}", row["Game"],
+                        [("Model %", f"{row['Model %']:.1f}%"),
+                         ("Market %", f"{row['Market %']:.1f}%"),
+                         ("Edge", f"{row['Edge']:.1f} pts"),
+                         ("Odds", f"{row['Best over']:.2f}")],
+                        reason=row["Reason"])
+
+        hr_t, hit_t, rbi_t, run_t, tb_t = st.tabs(
+            ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs", "📦 Total Bases"])
+        show_prop_market(hr_t, "Home Run")
+        show_prop_market(hit_t, "Hits")
+        show_prop_market(rbi_t, "RBI")
+        show_prop_market(run_t, "Runs")
+        show_prop_market(tb_t, "Total Bases")
+        st.caption("🟢 edge 2–8 · 🟡 8–15. Reds (15+) and no-signal (<2) are hidden. "
+                   "Model %: our probability · Market %: de-vigged book probability · "
+                   "Best over: best decimal price across US books. The model is still "
+                   "uncalibrated — paper-trade until it's backtested.")
 
 
 st.markdown("## 🔮 Most Likely — best hitters to achieve a market")
@@ -108,46 +124,56 @@ if st.button("Rank most likely hitters"):
         ml_df, ml_note = build_most_likely(sel_date)
     if ml_df is None:
         st.warning(ml_note)
+        st.session_state.pop("most_likely_df", None)
     else:
-        st.caption(ml_note)
+        # Fetch + store only — see the comment on the prop-edges button above for
+        # why the display can't live nested under this `if`.
         ml_df = ml_df.copy()
         ml_df["Game"] = ml_df["Game"] + " · " + ml_df["Start"]
+        st.session_state["most_likely_df"] = ml_df
+        st.session_state["most_likely_note"] = ml_note
 
-        def show_ml(tab, label, is_tb=False):
-            with tab:
-                sub = ml_df[ml_df["Market"] == label].copy()
-                if sub.empty:
-                    st.write("No ranked batters for this market.")
-                    return
-                value_label = "Expected TB" if is_tb else "Model prob %"
-                sub = sort_picker(sub, [
-                    (f"{value_label} (high to low)", "Value", False),
-                    ("Batting slot (low to high)", "Order", True),
-                ], key=f"sort_ml_{label}")
-                for _, row in sub.head(40).iterrows():
-                    value_str = f"{row['Value']:.2f}" if is_tb else f"{row['Value']:.1f}%"
-                    render_pick_card(
-                        None, row["Player"], f"{row['Game']} · Slot #{int(row['Order'])}",
-                        [(value_label, value_str)])
+if isinstance(st.session_state.get("most_likely_df"), pd.DataFrame):
+    ml_df = st.session_state["most_likely_df"]
+    ml_note = st.session_state.get("most_likely_note")
+    if ml_note:
+        st.caption(ml_note)
 
-        ml_hr, ml_hit, ml_rbi, ml_run, ml_combo, ml_tb = st.tabs(
-            ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs", "🎰 Runs+Hits+RBI", "📦 Total Bases"])
-        show_ml(ml_hr, "Home Run")
-        show_ml(ml_hit, "Hits")
-        show_ml(ml_rbi, "RBI")
-        show_ml(ml_run, "Runs")
-        show_ml(ml_combo, "Runs+Hits+RBI (1+)")
-        show_ml(ml_tb, "Total Bases (expected)", is_tb=True)
-        st.caption("Most likely is not the same as best bet: a player can be very likely yet "
-                   "fairly priced (no value). Cross-reference with Player Prop Edges. "
-                   "RBI and Runs probabilities include a calibration correction based on "
-                   "backtest data. The Runs+Hits+RBI market estimates probability of achieving "
-                   "at least one of the three, treating them as approximately independent. "
-                   "Total Bases is shown as an expected value, not a '1+' probability — since "
-                   "any hit already counts as 1+ total base, a threshold framing here would "
-                   "just duplicate the Hits market; compare the expected value against the "
-                   "book's line (often 1.5 or 2.5) yourself, or check Player Prop Edges for "
-                   "the priced-in version.")
+    def show_ml(tab, label, is_tb=False):
+        with tab:
+            sub = ml_df[ml_df["Market"] == label].copy()
+            if sub.empty:
+                st.write("No ranked batters for this market.")
+                return
+            value_label = "Expected TB" if is_tb else "Model prob %"
+            sub = sort_picker(sub, [
+                (f"{value_label} (high to low)", "Value", False),
+                ("Batting slot (low to high)", "Order", True),
+            ], key=f"sort_ml_{label}")
+            for _, row in sub.head(40).iterrows():
+                value_str = f"{row['Value']:.2f}" if is_tb else f"{row['Value']:.1f}%"
+                render_pick_card(
+                    None, row["Player"], f"{row['Game']} · Slot #{int(row['Order'])}",
+                    [(value_label, value_str)])
+
+    ml_hr, ml_hit, ml_rbi, ml_run, ml_combo, ml_tb = st.tabs(
+        ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs", "🎰 Runs+Hits+RBI", "📦 Total Bases"])
+    show_ml(ml_hr, "Home Run")
+    show_ml(ml_hit, "Hits")
+    show_ml(ml_rbi, "RBI")
+    show_ml(ml_run, "Runs")
+    show_ml(ml_combo, "Runs+Hits+RBI (1+)")
+    show_ml(ml_tb, "Total Bases (expected)", is_tb=True)
+    st.caption("Most likely is not the same as best bet: a player can be very likely yet "
+               "fairly priced (no value). Cross-reference with Player Prop Edges. "
+               "RBI and Runs probabilities include a calibration correction based on "
+               "backtest data. The Runs+Hits+RBI market estimates probability of achieving "
+               "at least one of the three, treating them as approximately independent. "
+               "Total Bases is shown as an expected value, not a '1+' probability — since "
+               "any hit already counts as 1+ total base, a threshold framing here would "
+               "just duplicate the Hits market; compare the expected value against the "
+               "book's line (often 1.5 or 2.5) yourself, or check Player Prop Edges for "
+               "the priced-in version.")
 
 
 if load_btn:
