@@ -17,82 +17,96 @@ if st.button("Analyse game bets (UK odds)"):
         gdf, gnote, gmeta = build_game_edges(sel_date)
     if gdf is None:
         st.warning(gnote)
+        st.session_state.pop("game_edges", None)
     else:
+        # Store everything needed to render below — this block only runs on the
+        # actual button click. Interacting with a "Sort by" dropdown afterwards
+        # triggers its own rerun in which st.button() is False again, so nothing
+        # nested under this `if` (including the dropdown itself) would fire.
+        # The fetch happens here; the display lives in the persistent block below.
         st.session_state["game_edges"] = gdf
-        if gmeta.get("remaining"):
-            st.caption(f"Odds quota — used {gmeta.get('used')}, "
-                       f"remaining {gmeta.get('remaining')}")
-        if gnote:
-            st.info(gnote)
-        _lights = gdf.apply(lambda r: classify_pick(r["Edge"], r["Model %"], r["Market"]), axis=1)
-        green = int((_lights == "🟢").sum())
-        amber = int((_lights == "🟡").sum())
-        red = int((_lights == "🔴").sum())
-        st.markdown(f"### 🟢 {green} green · 🟡 {amber} amber · 🔴 {red} red")
-        st.caption("🟢 2–8 pts = believable value · 🟡 8–15 = treat with caution · "
-                   "🔴 15+ = almost certainly a missing model input, not a real edge · "
-                   "⚪ under 2 = no signal. A suspiciously high raw model probability is "
-                   "also flagged red on its own, even with a small edge. (Player props like "
-                   "Runs/RBI/Total Bases use slightly wider bands — see the Player Props page.)")
+        st.session_state["game_edges_note"] = gnote
+        st.session_state["game_edges_meta"] = gmeta
 
-        def show_market(tab, market_name):
-            with tab:
-                sub = gdf[gdf["Market"] == market_name].copy()
-                if sub.empty:
-                    st.write("No odds available for this market today.")
-                    return
-                sub = sort_picker(sub, [
-                    ("Start time", "_ct", True),
-                    ("Edge (high to low)", "Edge", False),
-                    ("Model % (high to low)", "Model %", False),
-                    ("Odds (high to low)", "Odds", False),
-                ], key=f"sort_{market_name}")
-                for _, row in sub.iterrows():
-                    light = classify_pick(row["Edge"], row["Model %"], market_name)
-                    render_pick_card(
-                        light, f"{row['Selection']} @ {row['Odds']:.2f}",
-                        f"{row['Game']} · {row['Start']} ({row['US Date']})",
-                        [("Model %", f"{row['Model %']:.1f}%"),
-                         ("Fair %", f"{row['Fair %']:.1f}%"),
-                         ("Edge", f"{row['Edge']:.1f} pts"),
-                         ("EV %", f"{row['EV %']:.1f}%")],
-                        reason=row["Reason"])
+if isinstance(st.session_state.get("game_edges"), pd.DataFrame) and not st.session_state["game_edges"].empty:
+    gdf = st.session_state["game_edges"]
+    gnote = st.session_state.get("game_edges_note")
+    gmeta = st.session_state.get("game_edges_meta") or {}
 
-        def show_most_likely(tab):
-            with tab:
-                st.caption("Pure model confidence, ignoring the market entirely — this is "
-                           "'who/what does the model predict', not 'where's the value'. "
-                           "Ignore Fair %, Edge, and odds for this question; Model % alone "
-                           "answers it. A high % here is still not a guarantee — see the "
-                           "backtest for how often the model's confidence bands actually hit.")
-                mkt_pick = st.multiselect("Markets to include:",
-                                          ["Moneyline", "Run line", "Total"],
-                                          default=["Moneyline", "Run line", "Total"],
-                                          key="ml_market_pick")
-                sub = gdf[gdf["Market"].isin(mkt_pick)].copy()
-                if sub.empty:
-                    st.write("No selections match the chosen markets.")
-                    return
-                sub = sort_picker(sub, [
-                    ("Model % (high to low)", "Model %", False),
-                    ("Start time", "_ct", True),
-                ], key="sort_most_likely_gb")
-                for _, row in sub.iterrows():
-                    render_pick_card(
-                        None, f"{row['Selection']} · {row['Market']}",
-                        f"{row['Game']} · {row['Start']} ({row['US Date']})",
-                        [("Model %", f"{row['Model %']:.1f}%")])
+    if gmeta.get("remaining"):
+        st.caption(f"Odds quota — used {gmeta.get('used')}, "
+                   f"remaining {gmeta.get('remaining')}")
+    if gnote:
+        st.info(gnote)
+    _lights = gdf.apply(lambda r: classify_pick(r["Edge"], r["Model %"], r["Market"]), axis=1)
+    green = int((_lights == "🟢").sum())
+    amber = int((_lights == "🟡").sum())
+    red = int((_lights == "🔴").sum())
+    st.markdown(f"### 🟢 {green} green · 🟡 {amber} amber · 🔴 {red} red")
+    st.caption("🟢 2–8 pts = believable value · 🟡 8–15 = treat with caution · "
+               "🔴 15+ = almost certainly a missing model input, not a real edge · "
+               "⚪ under 2 = no signal. A suspiciously high raw model probability is "
+               "also flagged red on its own, even with a small edge. (Player props like "
+               "Runs/RBI/Total Bases use slightly wider bands — see the Player Props page.)")
 
-        ml_tab, rl_tab, tot_tab, most_likely_tab = st.tabs(
-            ["💰 Money Line", "📏 Run Line", "📊 Totals", "🎯 Most Likely"])
-        show_market(ml_tab, "Moneyline")
-        show_market(rl_tab, "Run line")
-        show_market(tot_tab, "Total")
-        show_most_likely(most_likely_tab)
-        st.caption("Model %: our probability · Fair %: book's de-vigged probability · "
-                   "Edge: model minus fair · EV %: expected return per unit stake at best "
-                   "odds. Heads-up: very large edges (15+ pts) usually mean the model is "
-                   "missing an input for that game (e.g. ballpark) rather than real value.")
+    def show_market(tab, market_name):
+        with tab:
+            sub = gdf[gdf["Market"] == market_name].copy()
+            if sub.empty:
+                st.write("No odds available for this market today.")
+                return
+            sub = sort_picker(sub, [
+                ("Start time", "_ct", True),
+                ("Edge (high to low)", "Edge", False),
+                ("Model % (high to low)", "Model %", False),
+                ("Odds (high to low)", "Odds", False),
+            ], key=f"sort_{market_name}")
+            for _, row in sub.iterrows():
+                light = classify_pick(row["Edge"], row["Model %"], market_name)
+                render_pick_card(
+                    light, f"{row['Selection']} @ {row['Odds']:.2f}",
+                    f"{row['Game']} · {row['Start']} ({row['US Date']})",
+                    [("Model %", f"{row['Model %']:.1f}%"),
+                     ("Fair %", f"{row['Fair %']:.1f}%"),
+                     ("Edge", f"{row['Edge']:.1f} pts"),
+                     ("EV %", f"{row['EV %']:.1f}%")],
+                    reason=row["Reason"])
+
+    def show_most_likely(tab):
+        with tab:
+            st.caption("Pure model confidence, ignoring the market entirely — this is "
+                       "'who/what does the model predict', not 'where's the value'. "
+                       "Ignore Fair %, Edge, and odds for this question; Model % alone "
+                       "answers it. A high % here is still not a guarantee — see the "
+                       "backtest for how often the model's confidence bands actually hit.")
+            mkt_pick = st.multiselect("Markets to include:",
+                                      ["Moneyline", "Run line", "Total"],
+                                      default=["Moneyline", "Run line", "Total"],
+                                      key="ml_market_pick")
+            sub = gdf[gdf["Market"].isin(mkt_pick)].copy()
+            if sub.empty:
+                st.write("No selections match the chosen markets.")
+                return
+            sub = sort_picker(sub, [
+                ("Model % (high to low)", "Model %", False),
+                ("Start time", "_ct", True),
+            ], key="sort_most_likely_gb")
+            for _, row in sub.iterrows():
+                render_pick_card(
+                    None, f"{row['Selection']} · {row['Market']}",
+                    f"{row['Game']} · {row['Start']} ({row['US Date']})",
+                    [("Model %", f"{row['Model %']:.1f}%")])
+
+    ml_tab, rl_tab, tot_tab, most_likely_tab = st.tabs(
+        ["💰 Money Line", "📏 Run Line", "📊 Totals", "🎯 Most Likely"])
+    show_market(ml_tab, "Moneyline")
+    show_market(rl_tab, "Run line")
+    show_market(tot_tab, "Total")
+    show_most_likely(most_likely_tab)
+    st.caption("Model %: our probability · Fair %: book's de-vigged probability · "
+               "Edge: model minus fair · EV %: expected return per unit stake at best "
+               "odds. Heads-up: very large edges (15+ pts) usually mean the model is "
+               "missing an input for that game (e.g. ballpark) rather than real value.")
 
 if isinstance(st.session_state.get("game_edges"), pd.DataFrame) and not st.session_state["game_edges"].empty:
     _ge = st.session_state["game_edges"]
