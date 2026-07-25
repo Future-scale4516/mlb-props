@@ -60,6 +60,9 @@ if "suggested_results" in st.session_state:
             st.caption("Checks today's games right now — pending, live winning/losing, or "
                        "already won/lost. One lost leg kills the whole combo, same as a "
                        "real bet. Re-click any time during the day for an updated read.")
+        show_form = st.checkbox(
+            f"Show last-{FORM_GAMES} games form on prop legs (slower — one lookup per player)",
+            key="suggested_form_toggle")
         if check_live:
             with st.spinner("Checking live scores and box scores..."):
                 live_status = {}
@@ -106,6 +109,12 @@ if "suggested_results" in st.session_state:
                                  f"— {leg['model_pct']:.1f}% model")
                         if leg.get("reason"):
                             st.caption(leg["reason"])
+                        if show_form and leg.get("kind") == "prop" and leg.get("player_id"):
+                            hits, played, syms = form_streak(
+                                int(leg["player_id"]), sel_date.year,
+                                leg.get("market_key"), leg.get("point", 0.5))
+                            if hits is not None and played:
+                                st.caption(f"Last {played}: {syms}  ({hits}/{played})")
                         if leg_live:
                             status, detail = leg_live[i]
                             st.caption(f"{STATUS_BADGE.get(status, status)} — {detail}")
