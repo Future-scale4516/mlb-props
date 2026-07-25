@@ -514,6 +514,123 @@ def get_secret(name: str, default: str = "") -> str:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def _snapshot_iso_for_start(start_iso, lead_minutes=60):
+    """Timestamp to request for a game starting at start_iso — `lead_minutes`
+    before first pitch, floored to a 5-minute boundary since that's the interval
+    historical snapshots are stored at. Returns None if the start is unusable."""
+    dt = _parse_iso_utc(start_iso)
+    if dt is None:
+        return None
+    snap = dt - timedelta(minutes=lead_minutes)
+    snap = snap.replace(minute=(snap.minute // 5) * 5, second=0, microsecond=0)
+    return snap.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_historical_mlb_odds(snapshot_iso, regions="uk",
+                               markets="h2h,spreads,totals", odds_format="decimal"):
+    """Game odds as they stood at a past moment.
+
+    COST WARNING: the historical endpoint bills 10 credits per region per market,
+    so this call is 30 credits for three markets on one region — roughly ten
+    times a live odds pull. Cached for a day since past odds never change."""
+    key = get_secret("ODDS_API_KEY")
+    if not key:
+        return [], {"error": "No ODDS_API_KEY found in Streamlit secrets."}
+    url = "https://api.the-odds-api.com/v4/historical/sports/baseball_mlb/odds"
+    try:
+        r = req.get(url, params={
+            "apiKey": key, "regions": regions, "markets": markets,
+            "oddsFormat": odds_format, "dateFormat": "iso", "date": snapshot_iso,
+        }, timeout=20)
+    except Exception as e:
+        return [], {"error": f"Request failed: {e}"}
+    meta = {"status": r.status_code, "remaining": r.headers.get("x-requests-remaining"),
+            "used": r.headers.get("x-requests-used"), "error": "",
+            "snapshot_requested": snapshot_iso}
+    if r.status_code != 200:
+        meta["error"] = f"HTTP {r.status_code}: {r.text[:300]}"
+        return [], meta
+    try:
+        payload = r.json()
+    except Exception as e:
+        meta["error"] = f"Bad JSON: {e}"
+        return [], meta
+    # Historical responses wrap the game list, unlike the live endpoint
+    meta["snapshot_actual"] = payload.get("timestamp")
+    return payload.get("data", []), meta
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_historical_event_props(event_id, markets, snapshot_iso,
+                                  regions="us", odds_format="decimal"):
+    """Player props for one game as they stood at a past moment. Costs about the
+    same as the live event-odds call (markets x regions), not the 10x rate the
+    featured historical endpoint charges."""
+    key = get_secret("ODDS_API_KEY")
+    if not key:
+        return None, {"error": "No ODDS_API_KEY in Streamlit secrets."}
+    url = ("https://api.the-odds-api.com/v4/historical/sports/baseball_mlb/"
+           f"events/{event_id}/odds")
+    try:
+        r = req.get(url, params={"apiKey": key, "regions": regions, "markets": markets,
+                                 "oddsFormat": odds_format, "dateFormat": "iso",
+                                 "date": snapshot_iso}, timeout=25)
+    except Exception as e:
+        return None, {"error": f"Request failed: {e}"}
+    meta = {"status": r.status_code, "remaining": r.headers.get("x-requests-remaining"),
+            "used": r.headers.get("x-requests-used"), "last": r.headers.get("x-requests-last"),
+            "error": "", "snapshot_requested": snapshot_iso}
+    if r.status_code != 200:
+        meta["error"] = f"HTTP {r.status_code}: {r.text[:300]}"
+        return None, meta
+    try:
+        payload = r.json()
+    except Exception as e:
+        meta["error"] = f"Bad JSON: {e}"
+        return None, meta
+    meta["snapshot_actual"] = payload.get("timestamp")
+    data = payload.get("data", payload)  # unwrap if wrapped
+    return data, meta
+
+
+def historical_slate_odds(sched, regions="uk", lead_minutes=60):
+    """Assemble game odds for a whole past slate, each game priced at its OWN
+    snapshot (lead_minutes before that game's first pitch).
+
+    Games starting close together share a snapshot, so this makes one call per
+    DISTINCT snapshot time rather than one per game — on a typical slate that's
+    a handful of calls instead of fifteen. Returns (odds_list, meta, snapshots)."""
+    groups = {}
+    for _, gm in sched.iterrows():
+        snap = _snapshot_iso_for_start(gm.get("game_date_raw"), lead_minutes)
+        if snap:
+            groups.setdefault(snap, []).append(gm)
+    merged, metas, used_snapshots = [], [], []
+    seen_ids = set()
+    for snap in sorted(groups):
+        want_pairs = {((g.get("home_team") or "").lower().strip(),
+                       (g.get("away_team") or "").lower().strip()) for g in groups[snap]}
+        data, meta = fetch_historical_mlb_odds(snap, regions=regions)
+        metas.append(meta)
+        used_snapshots.append({"requested": snap, "actual": meta.get("snapshot_actual"),
+                               "games": len(groups[snap]), "error": meta.get("error", "")})
+        for ev in data:
+            pair = ((ev.get("home_team") or "").lower().strip(),
+                    (ev.get("away_team") or "").lower().strip())
+            # only take games this snapshot was actually fetched for, so a game
+            # isn't priced off some other game's snapshot time
+            if pair in want_pairs and ev.get("id") not in seen_ids:
+                merged.append(ev)
+                seen_ids.add(ev.get("id"))
+    combined = {"used": metas[-1].get("used") if metas else None,
+                "remaining": metas[-1].get("remaining") if metas else None,
+                "error": next((m.get("error") for m in metas if m.get("error")), ""),
+                "calls": len(groups),
+                "credits_estimate": len(groups) * 30}
+    return merged, combined, used_snapshots
+
+
 def fetch_mlb_odds(regions: str = "us", markets: str = "h2h,spreads,totals",
                    odds_format: str = "decimal"):
     """Fetch MLB game odds from The Odds API.
@@ -1037,14 +1154,19 @@ def _total_reason(home_rpg, away_rpg, home_era, away_era, park, side,
     return joined[:1].upper() + joined[1:]
 
 
-def build_game_edges(sel_date):
+def build_game_edges(sel_date, odds_override=None, meta_override=None):
     """Match today's games to UK odds, run the model, return (df, note, meta)."""
     sched = fetch_schedule(str(sel_date))
     if sched.empty:
         return None, "No games scheduled for this date.", {}
     team_off, league_rpg = fetch_team_offense(sel_date.year)
     bullpen_era = fetch_bullpen_era(sel_date.year)
-    odds_data, meta = fetch_mlb_odds(regions="uk")
+    if odds_override is not None:
+        # Reconstructing a past slate from historical snapshots — see
+        # historical_slate_odds. Skips the live fetch entirely.
+        odds_data, meta = odds_override, (meta_override or {})
+    else:
+        odds_data, meta = fetch_mlb_odds(regions="uk")
     if meta.get("error"):
         return None, meta["error"], meta
     if not odds_data:
@@ -1523,13 +1645,17 @@ def _prop_reason(mkey, srow, opp_hr9, opp_k9, park, order, ahead_obp=LG_OBP_DEFA
     return ("; ".join(bits[:3]))[:1].upper() + ("; ".join(bits[:3]))[1:]
 
 
-def build_prop_edges(sel_date, max_games=6):
+def build_prop_edges(sel_date, max_games=6, snapshot_by_event=None,
+                     odds_override=None, meta_override=None):
     """Full slate prop edges: per-game props adjusted for the opposing starter and
     ballpark. Returns (df, meta, note). Green+amber only (edge 2-15) is filtered in UI."""
     sched = fetch_schedule(str(sel_date))
     if sched.empty:
         return None, {}, "No games scheduled for this date."
-    odds_games, meta = fetch_mlb_odds(regions="uk")
+    if odds_override is not None:
+        odds_games, meta = odds_override, (meta_override or {})
+    else:
+        odds_games, meta = fetch_mlb_odds(regions="uk")
     if not odds_games:
         if meta.get("error"):
             return None, meta, f"Odds request failed: {meta['error']}"
@@ -1575,7 +1701,12 @@ def build_prop_edges(sel_date, max_games=6):
         if gm is None:
             unmatched.append(f"{away} @ {home}"); continue
 
-        event, em = fetch_event_props(ev.get("id"), PROP_MARKETS, regions="us")
+        _snap = (snapshot_by_event or {}).get(ev.get("id"))
+        if _snap:
+            event, em = fetch_historical_event_props(ev.get("id"), PROP_MARKETS,
+                                                      _snap, regions="us")
+        else:
+            event, em = fetch_event_props(ev.get("id"), PROP_MARKETS, regions="us")
         analysed += 1
         if em.get("remaining"):
             last_meta = em
@@ -2088,6 +2219,200 @@ def evaluate_combo_status(combo):
     return overall, leg_results
 
 
+
+
+
+def build_priced_results(sel_date, max_games=8, lead_minutes=60):
+    """Reconstruct the value picks the app WOULD have shown for a past date —
+    using real bookmaker odds from a snapshot `lead_minutes` before each game's
+    first pitch — then score them against the actual box scores.
+
+    Unlike build_prop_results (model reads only), this includes the real edge,
+    traffic-light colour and price, because historical odds are available on a
+    paid plan. It costs real credits: roughly 30 per distinct snapshot time for
+    game lines, plus ~5 per game for props.
+
+    Returns (df, note, cost_info)."""
+    sched = fetch_schedule(str(sel_date))
+    if sched.empty:
+        return None, "No games scheduled for that date.", {}
+
+    odds, ometa, snaps = historical_slate_odds(sched, regions="uk",
+                                               lead_minutes=lead_minutes)
+    if not odds:
+        err = ometa.get("error") or ""
+        return None, (f"No historical odds returned for that date. {err}").strip(), \
+               {"snapshots": snaps, "credits_estimate": ometa.get("credits_estimate", 0)}
+
+    snap_by_event = {}
+    for ev in odds:
+        s = _snapshot_iso_for_start(ev.get("commence_time"), lead_minutes)
+        if s:
+            snap_by_event[ev.get("id")] = s
+
+    pdf, pmeta, pnote = build_prop_edges(sel_date, max_games,
+                                         snapshot_by_event=snap_by_event,
+                                         odds_override=odds, meta_override=ometa)
+    cost = {"snapshots": snaps,
+            "game_line_credits": ometa.get("credits_estimate", 0),
+            "prop_games": min(max_games, len(odds)),
+            "remaining": pmeta.get("remaining") if pmeta else ometa.get("remaining")}
+    if pdf is None or pdf.empty:
+        return None, (pnote or "No qualifying value picks found for that date."), cost
+
+    ACTUAL_KEY = {"batter_home_runs": "hr", "batter_hits": "hits",
+                  "batter_rbis": "rbi", "batter_runs_scored": "runs",
+                  "batter_total_bases": "total_bases"}
+    box_by_game = {}
+    for gp in pdf["GamePk"].dropna().unique():
+        box_by_game[int(gp)] = {int(b["player_id"]): b
+                                for b in fetch_boxscore_batters(int(gp))
+                                if b.get("player_id")}
+
+    rows = []
+    for _, r in pdf.iterrows():
+        gp = r.get("GamePk")
+        pid = r.get("PlayerID")
+        mkey = r.get("MarketKey")
+        point = r.get("Point")
+        if gp is None or pid is None or mkey not in ACTUAL_KEY or point is None:
+            continue
+        b = box_by_game.get(int(gp), {}).get(int(pid))
+        if not b:
+            continue  # didn't appear in the box score (scratched, or DNP)
+        actual = b.get(ACTUAL_KEY[mkey], 0)
+        hit = bool(actual > float(point))
+        odds_dec = float(r.get("Best over") or 0)
+        # Profit on a 1-unit stake at the price that was actually available
+        pl = (odds_dec - 1.0) if hit else -1.0
+        rows.append({
+            "Market": r["Market"], "Light": r["Light"], "Player": r["Player"],
+            "Game": r["Game"], "Line": r["Line"],
+            "Model %": r["Model %"], "Market %": r["Market %"], "Edge": r["Edge"],
+            "Odds": odds_dec, "Actual": actual, "Hit": hit,
+            "P/L (1u)": round(pl, 2), "Reason": r.get("Reason", ""),
+        })
+
+    if not rows:
+        return None, ("Picks were reconstructed, but no matching box-score lines were "
+                      "found — the games may not have completed yet."), cost
+    return pd.DataFrame(rows), f"Reconstructed and scored {len(rows)} value picks.", cost
+
+
+def build_prop_results(sel_date, max_games=None):
+    """Score the model's own prop predictions for ONE date against what actually
+    happened in the box scores. Returns (df, note).
+
+    Important limitation, stated plainly: The Odds API only serves current and
+    upcoming odds, not historical ones. So for a date that's already played,
+    the bookmaker prices — and therefore the edge, the green/amber colour, and
+    which specific combos Suggested Bets built — genuinely cannot be
+    reconstructed. What CAN be rebuilt is the model's own probability for every
+    batter, using the real lineup and starter from that game, and checked
+    against the real result. That's what this does: it answers "were the
+    model's reads right?", not "what price was showing at the time?"."""
+    results = fetch_day_results(str(sel_date))
+    finals = [r for r in results if r.get("state") == "Final"]
+    if not finals:
+        return None, ("No completed games on this date yet — results appear once "
+                      "games finish.")
+    if max_games:
+        finals = finals[:max_games]
+
+    bat = fetch_all_mlb_batting_stats(sel_date.year)
+    if bat.empty:
+        return None, "No batter stats available."
+    stat_by_id = {int(r["player_id"]): r for r in bat.to_dict("records") if r.get("player_id")}
+    bats_map, throws_map = fetch_player_handedness(sel_date.year)
+
+    LABEL = {"batter_home_runs": "Home Run", "batter_hits": "Hits",
+             "batter_rbis": "RBI", "batter_runs_scored": "Runs"}
+    ACTUAL_KEY = {"batter_home_runs": "hr", "batter_hits": "hits",
+                  "batter_rbis": "rbi", "batter_runs_scored": "runs",
+                  "batter_total_bases": "total_bases"}
+
+    rows, games_scored = [], 0
+    for r in finals:
+        gp = r.get("gamePk")
+        if not gp:
+            continue
+        box = fetch_boxscore_batters(gp)
+        if not box:
+            continue
+        games_scored += 1
+        hid = int(r.get("home_team_id") or 0)
+        aid = int(r.get("away_team_id") or 0)
+        park = apply_weather_to_park(PARK_FACTORS.get(hid, NEUTRAL_PARK),
+                                     fetch_weather(r.get("venue", "")))
+        sched_rows = fetch_schedule(str(sel_date))
+        gm_row = None
+        if not sched_rows.empty:
+            match = sched_rows[sched_rows["gamePk"] == gp]
+            if not match.empty:
+                gm_row = match.iloc[0]
+        away_pid = gm_row.get("away_prob_id") if gm_row is not None else None
+        home_pid = gm_row.get("home_prob_id") if gm_row is not None else None
+        away_sp = fetch_pitcher_stats(away_pid)
+        home_sp = fetch_pitcher_stats(home_pid)
+
+        slot_by_team = {hid: {}, aid: {}}
+        for b in box:
+            tid_b = b.get("team_id")
+            if tid_b in slot_by_team and b.get("order"):
+                slot_by_team[tid_b][int(b["order"])] = b["player_id"]
+
+        gl = f"{TEAM_ABBR.get(aid, r.get('away_team',''))} @ {TEAM_ABBR.get(hid, r.get('home_team',''))}"
+        score_txt = f"{r.get('away_score')}-{r.get('home_score')}"
+
+        for b in box:
+            pid = int(b.get("player_id") or 0)
+            srow = stat_by_id.get(pid)
+            if not srow:
+                continue
+            if (srow.get("plateAppearances") or 0) < MIN_PA_FOR_RANKING:
+                continue
+            is_home = b.get("team_id") == hid
+            opp_sp = away_sp if is_home else home_sp
+            opp_pid = away_pid if is_home else home_pid
+            opp_hr9 = float(opp_sp.get("homeRunsPer9", LG_HR9) or LG_HR9)
+            opp_k9 = float(opp_sp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
+            opp_whip = float(opp_sp.get("whip", LG_WHIP) or LG_WHIP)
+            ahead_obp, behind_slg = _lineup_context(
+                b["order"], slot_by_team.get(b["team_id"], {}), stat_by_id)
+            pf_platoon = platoon_factor(bats_map.get(pid),
+                                        throws_map.get(int(opp_pid)) if opp_pid else None)
+            lam = prop_expected_counts(srow, expected_pa(b["order"]), opp_hr9, opp_k9,
+                                       opp_whip, ahead_obp, behind_slg,
+                                       park["hr"], park["run"], platoon=pf_platoon)
+
+            for mkey, label in LABEL.items():
+                p = _p_over_line(lam[mkey], 0.5)
+                if p is None:
+                    continue
+                p = _calibration_adjust(p, label)
+                actual = b.get(ACTUAL_KEY[mkey], 0)
+                rows.append({
+                    "Market": label, "Player": b.get("name", ""), "Game": gl,
+                    "Score": score_txt, "Slot": b["order"],
+                    "Model %": round(p * 100, 1), "Line": "1+",
+                    "Actual": actual, "Hit": bool(actual >= 1),
+                })
+            # Total Bases is judged at 2+ (a single already gives 1 TB, so a
+            # 1+ line would just duplicate the Hits market)
+            p_tb = _p_over_line(lam["batter_total_bases"], 1.5)
+            if p_tb is not None:
+                actual_tb = b.get("total_bases", 0)
+                rows.append({
+                    "Market": "Total Bases", "Player": b.get("name", ""), "Game": gl,
+                    "Score": score_txt, "Slot": b["order"],
+                    "Model %": round(p_tb * 100, 1), "Line": "2+",
+                    "Actual": actual_tb, "Hit": bool(actual_tb > 1.5),
+                })
+
+    if not rows:
+        return None, "No box-score data available for this date's games yet."
+    df = pd.DataFrame(rows)
+    return df, f"Scored {games_scored} completed game(s) on {sel_date}."
 
 
 
