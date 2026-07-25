@@ -13,6 +13,35 @@ except Exception:
     _ET = None
     _UTC = None
 
+# --- Platoon (handedness) ---------------------------------------------------
+# League-average platoon effect, NOT per-batter splits. Individual batter splits
+# exist but need a separate call per player and are thin-sample noisy for most
+# hitters, so this applies the well-established league-wide effect instead:
+# batters do better against opposite-handed pitching. Switch hitters ("S") get
+# no adjustment since they bat from whichever side is favourable anyway.
+PLATOON_ADVANTAGE = 1.06     # opposite-handed matchup (e.g. LHB vs RHP)
+PLATOON_DISADVANTAGE = 0.94  # same-handed matchup (e.g. RHB vs RHP)
+
+# --- Recent form ------------------------------------------------------------
+RECENT_FORM_DAYS = 30        # window for "recent form" stats
+RECENT_FORM_WEIGHT = 0.25    # how much recent form displaces the season rate.
+                             # Deliberately light: short windows are noisy, so this
+                             # nudges toward a hot/cold streak rather than trusting
+                             # it over a full season's evidence.
+MIN_PA_FOR_RECENT_FORM = 20  # below this, the recent window is too thin to use
+
+# --- Calibration corrections ------------------------------------------------
+# Per-market shrinkage toward a base rate, applied to raw model probabilities.
+# These are DERIVED, not guessed: run "Fit calibration from backtest" on the
+# Backtest page and paste the numbers it prints here. Starting values below are
+# the earlier hand-set ones, kept so behaviour doesn't change until refitted.
+# shrink=0 means "no correction, this market is already well calibrated".
+CALIBRATION_FITS = {
+    "RBI":  {"base": 0.280, "shrink": 0.300},
+    "Runs": {"base": 0.360, "shrink": 0.180},
+    # Hits, Home Run, Total Bases: no correction applied yet.
+}
+
 BALLPARKS = {
     "Oriole Park at Camden Yards": {"lat":39.2839,"lon":-76.6217,"factor":1.02,"dome":False},
     "Yankee Stadium":              {"lat":40.8296,"lon":-73.9262,"factor":1.05,"dome":False},
@@ -122,6 +151,89 @@ def fetch_results(target_date: str):
                 "home_score": int(hs), "away_score": int(as_)})
     return out
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_day_results(target_date: str):
+    """Every game on a date with team names, status and score — including games
+    still in progress or not yet started. Short TTL so an in-progress score
+    stays current. Free MLB data, no Odds API quota."""
+    data = safe_get("https://statsapi.mlb.com/api/v1/schedule", {
+        "sportId": 1, "date": target_date, "hydrate": "team,linescore,venue"})
+    out = []
+    for d in data.get("dates", []):
+        for g in d.get("games", []):
+            t = g.get("teams", {})
+            status = g.get("status", {})
+            ls = g.get("linescore", {})
+            out.append({
+                "gamePk": g.get("gamePk"),
+                "game_number": g.get("gameNumber", 1),
+                "double_header": g.get("doubleHeader", "N"),
+                "state": status.get("abstractGameState", "Preview"),  # Preview/Live/Final
+                "detail": status.get("detailedState", ""),
+                "home_team": t.get("home", {}).get("team", {}).get("name", ""),
+                "away_team": t.get("away", {}).get("team", {}).get("name", ""),
+                "home_team_id": t.get("home", {}).get("team", {}).get("id"),
+                "away_team_id": t.get("away", {}).get("team", {}).get("id"),
+                "home_score": t.get("home", {}).get("score"),
+                "away_score": t.get("away", {}).get("score"),
+                "inning": ls.get("currentInning"),
+                "inning_state": ls.get("inningState", ""),
+                "venue": g.get("venue", {}).get("name", ""),
+                "start_utc": g.get("gameDate", ""),
+            })
+    return out
+
+
+_FORM_STAT_KEY = {"batter_home_runs": "homeRuns", "batter_hits": "hits",
+                  "batter_rbis": "rbi", "batter_runs_scored": "runs",
+                  "batter_total_bases": "totalBases"}
+FORM_GAMES = 10  # 10 rather than 5: with a ~65% market like 1+ Hits, five games
+                 # only gives six possible outcomes and the gap between 3/5 and
+                 # 4/5 is mostly noise. Ten gives real resolution without
+                 # reaching so far back it stops reflecting current form.
+
+
+@st.cache_data(ttl=10800, show_spinner=False)
+def fetch_player_game_log(player_id, season, games=FORM_GAMES):
+    """Per-game batting lines for one player's most recent `games` appearances.
+    There's no bulk endpoint for this — it's one call per player — so it's
+    cached hard and should only be called for players actually being displayed."""
+    if not player_id:
+        return []
+    data = safe_get(f"https://statsapi.mlb.com/api/v1/people/{int(player_id)}/stats", {
+        "stats": "gameLog", "group": "hitting", "season": season})
+    splits = []
+    for s in data.get("stats", []):
+        splits.extend(s.get("splits", []))
+    splits = [s for s in splits if (s.get("stat") or {}).get("plateAppearances")]
+    splits.sort(key=lambda s: s.get("date", ""), reverse=True)
+    return [{"date": s.get("date", ""), **(s.get("stat") or {})} for s in splits[:games]]
+
+
+def form_streak(player_id, season, market_key, line, games=FORM_GAMES):
+    """Did this player clear `line` in this market in each of the last `games`?
+    Checks the ACTUAL line (so a 2+ Total Bases pick is judged on clearing 2
+    bases, not just on appearing). Returns (hits, played, symbols) — or
+    (None, 0, "") when there's no usable log."""
+    stat_key = _FORM_STAT_KEY.get(market_key)
+    if not stat_key:
+        return None, 0, ""
+    log = fetch_player_game_log(player_id, season, games)
+    if not log:
+        return None, 0, ""
+    syms, hits = [], 0
+    for g in log:
+        try:
+            val = float(g.get(stat_key) or 0)
+        except Exception:
+            val = 0.0
+        ok = val > float(line)
+        hits += 1 if ok else 0
+        syms.append("✅" if ok else "❌")
+    syms.reverse()  # oldest first, so it reads left-to-right chronologically
+    return hits, len(log), "".join(syms)
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_all_mlb_batting_stats(season: int):
     data = safe_get("https://statsapi.mlb.com/api/v1/stats", {
@@ -156,6 +268,164 @@ def fetch_all_mlb_batting_stats(season: int):
             "k_pct":            round(so / pa, 4) if pa > 0 else 0.22,
         })
     return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_player_handedness(season: int):
+    """Bat side (L/R/S) and pitch hand (L/R) for every player in one bulk call —
+    handedness is a fixed attribute, so this is cached for a day. Returns
+    (dict{player_id: bat_side}, dict{player_id: pitch_hand})."""
+    data = safe_get("https://statsapi.mlb.com/api/v1/sports/1/players", {"season": season})
+    bats, throws = {}, {}
+    for p in data.get("people", []):
+        pid = p.get("id")
+        if not pid:
+            continue
+        bs = (p.get("batSide") or {}).get("code")
+        ph = (p.get("pitchHand") or {}).get("code")
+        if bs:
+            bats[int(pid)] = bs
+        if ph:
+            throws[int(pid)] = ph
+    return bats, throws
+
+
+def data_confidence(pitcher_known=True, lineup_confirmed=True, batter_pa=None,
+                     handedness_known=True, weather_known=True):
+    """How much real data went into a pick, as distinct from how big its edge is.
+
+    This exists because a pick built on a confirmed lineup, a named starter with
+    a real stat line, and a 600-PA batter currently looks IDENTICAL to one built
+    on a projected lineup, a TBD starter (where we silently substitute a
+    league-average 4.50 ERA), and a 40-PA batter. Both can come out as "no
+    signal" — but the first genuinely means "model and market agree", while the
+    second means "the model doesn't really have an opinion here". Returns
+    (level, missing_list) where level is 'high' | 'medium' | 'low'."""
+    missing = []
+    if not pitcher_known:
+        missing.append("starter not announced (league-average ERA assumed)")
+    if not lineup_confirmed:
+        missing.append("lineup not confirmed (batting slot estimated)")
+    if batter_pa is not None and batter_pa < 100:
+        missing.append(f"small sample ({int(batter_pa)} PA this season)")
+    if not handedness_known:
+        missing.append("handedness unknown (no platoon adjustment)")
+    if not weather_known:
+        missing.append("weather unavailable")
+    if not missing:
+        return "high", []
+    # A missing starter or unconfirmed lineup are the two that genuinely gut the
+    # model's inputs; the rest just soften it.
+    severe = (not pitcher_known) or (not lineup_confirmed)
+    return ("low" if severe else "medium"), missing
+
+
+CONFIDENCE_BADGE = {"high": "🔵 Full data", "medium": "🟠 Partial data",
+                    "low": "⚫ Thin data"}
+
+
+def explain_no_signal(confidence_level, missing):
+    """Plain-English explanation for a ⚪ no-signal pick. Distinguishes genuine
+    model/market agreement (the normal, healthy case) from a pick where the
+    model simply didn't have the inputs to form a view."""
+    if confidence_level == "high":
+        return ("No signal — the model and the market agree here. That's the "
+                "expected outcome for most bets in a liquid market, not a fault.")
+    return ("No signal, but note the model is working with incomplete inputs: "
+            + "; ".join(missing) + ". Treat this as 'no opinion' rather than "
+            "'genuine agreement'.")
+
+
+def weather_multiplier(wx):
+    """Same-day weather adjustment applied ON TOP of a park's static factor, for
+    the modern engine (game model + prop model). Returns 1.0 for domes.
+
+    Deliberately asymmetric in what it trusts:
+      - Temperature is the dependable part — warm air is less dense, the ball
+        carries further, and the direction of the effect is unambiguous.
+      - Wind is NOT — the API gives speed but not direction relative to the
+        park's orientation, and wind blowing in suppresses offense as much as
+        wind blowing out helps it. So wind only gets a small nudge for the
+        general "windy days are livelier" effect, not the full-size adjustment
+        the old scoring pipeline applied. This is a smaller, more honest
+        correction than pretending we know which way it's blowing."""
+    if not wx or wx.get("dome"):
+        return 1.0
+    temp = float(wx.get("temp", 72) or 72)
+    wind = float(wx.get("wind", 8) or 8)
+    mult = 1.0 + (temp - 70) * 0.0030 + max(wind - 8, 0) * 0.0015
+    return max(0.90, min(mult, 1.12))
+
+
+def apply_weather_to_park(park, wx):
+    """Combine a park's static run/HR factors with today's weather."""
+    m = weather_multiplier(wx)
+    return {"run": park.get("run", 1.0) * m, "hr": park.get("hr", 1.0) * m}
+
+
+def platoon_factor(bat_side, pitch_hand):
+    """League-average platoon multiplier for a batter/pitcher handedness matchup.
+    Returns 1.0 (neutral) when either side is unknown or the batter is a switch
+    hitter — never guesses when the data isn't there."""
+    if not bat_side or not pitch_hand or bat_side == "S":
+        return 1.0
+    return PLATOON_DISADVANTAGE if bat_side == pitch_hand else PLATOON_ADVANTAGE
+
+
+@st.cache_data(ttl=10800, show_spinner=False)
+def fetch_recent_form(season: int, end_date_str: str, days: int = RECENT_FORM_DAYS):
+    """Per-batter rates over the last `days` before end_date_str, in one bulk
+    call. Used to nudge season rates toward current form. Returns
+    dict{player_id: {pa, avg, obp, slg, hr_rate, hits_rate, rbi_rate, runs_rate}}."""
+    try:
+        end_d = datetime.strptime(str(end_date_str), "%Y-%m-%d").date()
+    except Exception:
+        return {}
+    start_d = end_d - timedelta(days=days)
+    data = safe_get("https://statsapi.mlb.com/api/v1/stats", {
+        "stats": "byDateRange", "group": "hitting", "season": season,
+        "sportId": 1, "playerPool": "ALL", "limit": 2000,
+        "startDate": start_d.strftime("%m/%d/%Y"), "endDate": end_d.strftime("%m/%d/%Y"),
+    })
+    out = {}
+    for split in data.get("stats", [{}])[0].get("splits", []):
+        p = split.get("player", {}); stat = split.get("stat", {})
+        pid = int(p.get("id", 0) or 0)
+        pa = int(stat.get("plateAppearances") or 0)
+        if not pid or pa < MIN_PA_FOR_RECENT_FORM:
+            continue
+        out[pid] = {
+            "pa": pa,
+            "avg": float(stat.get("avg") or 0), "obp": float(stat.get("obp") or 0),
+            "slg": float(stat.get("slg") or 0),
+            "hr_rate": (int(stat.get("homeRuns") or 0)) / pa,
+            "hits_rate": (int(stat.get("hits") or 0)) / pa,
+            "rbi_rate": (int(stat.get("rbi") or 0)) / pa,
+            "runs_rate": (int(stat.get("runs") or 0)) / pa,
+        }
+    return out
+
+
+def blend_recent_form(srow, recent):
+    """Return a copy of a batter's season stat row with rates nudged toward
+    recent form. Weighted lightly (RECENT_FORM_WEIGHT) because short windows are
+    noisy — this catches a genuine hot/cold streak without letting a good
+    fortnight override a full season. Returns the row unchanged if there's no
+    usable recent data."""
+    if not recent:
+        return srow
+    spa = max(srow.get("plateAppearances", 1) or 1, 1)
+    w = RECENT_FORM_WEIGHT
+    out = dict(srow)
+    for season_key, rate_key in (("hr", "hr_rate"), ("hits", "hits_rate"),
+                                 ("rbi", "rbi_rate"), ("runs", "runs_rate")):
+        season_rate = (srow.get(season_key, 0) or 0) / spa
+        blended = season_rate * (1 - w) + recent[rate_key] * w
+        out[season_key] = blended * spa  # keep it as a count; /spa downstream recovers the rate
+    for k in ("avg", "obp", "slg"):
+        if recent.get(k):
+            out[k] = (srow.get(k, 0) or 0) * (1 - w) + recent[k] * w
+    return out
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_savant_stats(season: int):
@@ -795,7 +1065,7 @@ def build_game_edges(sel_date):
     def norm(s): return (s or "").lower().strip()
     odds_index = _index_by_teams(odds_data, "home_team", "away_team")
 
-    rows, unmatched, game_time = [], [], {}
+    rows, unmatched, game_time, game_conf = [], [], {}, {}
     for _, gm in sched.iterrows():
         home, away = gm.get("home_team"), gm.get("away_team")
         candidates = odds_index.get((norm(home), norm(away)), [])
@@ -816,6 +1086,10 @@ def build_game_edges(sel_date):
         hid = int(gm.get("home_team_id") or 0)
         aid = int(gm.get("away_team_id") or 0)
         pf = PARK_FACTORS.get(hid, NEUTRAL_PARK)
+        # Same-day weather on top of the park's static factor (see weather_multiplier)
+        _wx = fetch_weather(gm.get("venue", ""))
+        pf = apply_weather_to_park(pf, _wx)
+        _wx_known = bool(gm.get("venue")) and gm.get("venue") in BALLPARKS
         home_rpg = _park_neutral_rpg(team_off.get(hid, league_rpg), pf["run"])
         away_rpg = _park_neutral_rpg(team_off.get(aid, league_rpg),
                                      PARK_FACTORS.get(aid, NEUTRAL_PARK)["run"])
@@ -823,6 +1097,11 @@ def build_game_edges(sel_date):
         home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
         away_bp = bullpen_era.get(aid, LEAGUE_BULLPEN_ERA_DEFAULT)
         home_bp = bullpen_era.get(hid, LEAGUE_BULLPEN_ERA_DEFAULT)
+        _pitchers_known = (away_sp.get("name", "TBD") != "TBD"
+                           and home_sp.get("name", "TBD") != "TBD")
+        _conf_level, _conf_missing = data_confidence(
+            pitcher_known=_pitchers_known, lineup_confirmed=True,
+            batter_pa=None, handedness_known=True, weather_known=_wx_known)
         cons = consolidate_odds(og, og.get("home_team"), og.get("away_team"))
         mdl = model_game(home_rpg, away_rpg, away_sp.get("era", 4.5),
                          home_sp.get("era", 4.5), league_rpg, LEAGUE_ERA_DEFAULT,
@@ -831,6 +1110,7 @@ def build_game_edges(sel_date):
         gl = f"{TEAM_ABBR.get(aid, away)} @ {TEAM_ABBR.get(hid, home)}{_dh_suffix(gm)}"
         ct = og.get("commence_time") or ""
         game_time[gl] = (ct, _commence_to_bst(ct), _commence_to_et_str(ct))
+        game_conf[gl] = (_conf_level, _conf_missing)
 
         home_era = home_sp.get("era", 4.5)
         away_era = away_sp.get("era", 4.5)
@@ -886,6 +1166,8 @@ def build_game_edges(sel_date):
     df["_ct"] = df["Game"].map(lambda g: game_time.get(g, ("", "", ""))[0])
     df["Start"] = df["Game"].map(lambda g: game_time.get(g, ("", "", ""))[1])
     df["US Date"] = df["Game"].map(lambda g: game_time.get(g, ("", "", ""))[2])
+    df["Confidence"] = df["Game"].map(lambda g: game_conf.get(g, ("high", []))[0])
+    df["DataNotes"] = df["Game"].map(lambda g: "; ".join(game_conf.get(g, ("high", []))[1]))
     df = df.sort_values(["_ct", "Game"]).reset_index(drop=True)
     note = (f"Couldn't match odds for: {', '.join(unmatched)}" if unmatched else "")
     return df, note, meta
@@ -965,24 +1247,69 @@ def _calibration_adjust(raw_p, market):
     Runs shows a similar but milder pattern. Hits and HR are already well-calibrated
     and pass through unchanged.
 
-    The correction uses a simple linear shrinkage toward the base rate, with the
-    shrinkage fraction set per-market based on observed backtest gaps. This is
-    intentionally conservative — it pulls overconfident predictions partway back
-    rather than trying to perfectly remap every decile, which would overfit to a
-    specific backtest window."""
-    if market == "RBI":
-        # RBI backtest showed ~30% overconfidence in the 40-70% bands.
-        # Shrink toward the base rate (0.28) by 30%.
-        base = 0.28
-        shrink = 0.30
-        return raw_p * (1 - shrink) + base * shrink
-    elif market == "Runs":
-        # Runs showed ~15-20% overconfidence in the upper bands.
-        # Lighter shrinkage toward base rate (0.36).
-        base = 0.36
-        shrink = 0.18
-        return raw_p * (1 - shrink) + base * shrink
-    return raw_p
+    The correction is a simple linear shrinkage toward a base rate. The numbers
+    live in CALIBRATION_FITS below — update them by running "Fit calibration
+    from backtest" on the Backtest page, which derives them from the actual
+    reliability curve rather than by eye."""
+    fit = CALIBRATION_FITS.get(market)
+    if not fit or not fit.get("shrink"):
+        return raw_p
+    return raw_p * (1 - fit["shrink"]) + fit["base"] * fit["shrink"]
+
+
+def fit_calibration(recs, market, min_samples=200):
+    """Derive a calibration correction for one market from real backtest records
+    instead of setting it by eye.
+
+    Method: the correction we apply is `adjusted = p*(1-s) + b*s`, which
+    rearranges to `adjusted = p*(1-s) + (b*s)`. That's just a straight line in
+    p — so fitting it is a weighted least-squares regression of what ACTUALLY
+    happened against what the model PREDICTED, across the decile buckets, with
+    each bucket weighted by how many samples it holds (so sparse bands like the
+    thin upper HR buckets can't drag the fit around).
+
+    slope = 1 - shrink, intercept = base * shrink.
+
+    Returns (fit_dict_or_None, message)."""
+    rows = [(p, o) for mk, p, o in recs if mk == market]
+    if len(rows) < min_samples:
+        return None, f"{market}: only {len(rows)} samples, need {min_samples}+ to fit reliably."
+
+    buckets = {}
+    for p, o in rows:
+        b = min(int(p * 10), 9)
+        buckets.setdefault(b, []).append((p, o))
+    pts = []
+    for b, vals in buckets.items():
+        n = len(vals)
+        if n < 20:
+            continue  # too thin to trust this band at all
+        mean_p = sum(v[0] for v in vals) / n
+        actual = sum(v[1] for v in vals) / n
+        pts.append((mean_p, actual, n))
+    if len(pts) < 3:
+        return None, f"{market}: only {len(pts)} usable probability bands, need 3+."
+
+    tot_w = sum(n for _, _, n in pts)
+    mean_x = sum(x * n for x, _, n in pts) / tot_w
+    mean_y = sum(y * n for _, y, n in pts) / tot_w
+    num = sum(n * (x - mean_x) * (y - mean_y) for x, y, n in pts)
+    den = sum(n * (x - mean_x) ** 2 for x, _, n in pts)
+    if den <= 0:
+        return None, f"{market}: predictions show no spread, can't fit."
+    slope = num / den
+    intercept = mean_y - slope * mean_x
+
+    shrink = 1.0 - slope
+    if shrink <= 0.01:
+        return ({"base": 0.0, "shrink": 0.0},
+                f"{market}: already well calibrated (slope {slope:.2f}) — no correction needed.")
+    shrink = min(shrink, 0.60)  # never shrink more than 60% toward base
+    base = intercept / shrink
+    base = max(0.0, min(base, 1.0))
+    return ({"base": round(base, 3), "shrink": round(shrink, 3)},
+            f"{market}: fitted from {len(rows)} samples across {len(pts)} bands "
+            f"(slope {slope:.3f}).")
 
 
 def _combo_prob(probs):
@@ -998,7 +1325,7 @@ def _combo_prob(probs):
 
 def prop_expected_counts(stat, pa, opp_hr9=LG_HR9, opp_k9=LG_K9, opp_whip=LG_WHIP,
                           ahead_obp=LG_OBP_DEFAULT, behind_slg=LG_SLG_DEFAULT,
-                          park_hr=1.0, park_run=1.0):
+                          park_hr=1.0, park_run=1.0, platoon=1.0):
     """Expected per-game counts (Poisson lambdas) for each batter prop market.
     Season rate carries the hitter's talent; pitcher + park + lineup are the
     adjustments. HR uses the opposing starter's HR9, Hits uses their K9. RBI uses
@@ -1010,24 +1337,31 @@ def prop_expected_counts(stat, pa, opp_hr9=LG_HR9, opp_k9=LG_K9, opp_whip=LG_WHI
     SLG (bases per at-bat) — a good pitcher's low HR9 suppresses power, a high K9
     suppresses contact overall, and park blends both HR- and hit-friendliness
     since extra-base hits benefit from both."""
+    # `platoon` is the handedness multiplier (see platoon_factor). It's applied to
+    # the markets that depend on the batter actually squaring the ball up — HR,
+    # Hits, Total Bases — at full strength. RBI and Runs get a damped version,
+    # since those depend heavily on teammates (traffic ahead, power behind) as
+    # well as the batter's own contact, so the platoon edge is diluted.
+    platoon_damped = 1.0 + (platoon - 1.0) * 0.5
+
     spa = max(stat.get("plateAppearances", 1) or 1, 1)
-    hr_l = (stat.get("hr", 0) / spa) * (opp_hr9 / LG_HR9) * park_hr * pa
+    hr_l = (stat.get("hr", 0) / spa) * (opp_hr9 / LG_HR9) * park_hr * platoon * pa
     hits = stat.get("hits")
     hit_rate = (hits / spa) if hits is not None else stat.get("avg", 0) * 0.88
     k_factor = 1.0 - 0.5 * min(max((opp_k9 - LG_K9) / LG_K9, -0.3), 0.3)
-    hit_l = hit_rate * k_factor * (1.0 + 0.5 * (park_run - 1.0)) * pa
+    hit_l = hit_rate * k_factor * (1.0 + 0.5 * (park_run - 1.0)) * platoon * pa
 
     whip_factor = 1.0 + 0.5 * min(max((opp_whip - LG_WHIP) / LG_WHIP, -0.3), 0.3)
     traffic_factor = 1.0 + 0.6 * min(max((ahead_obp - LG_OBP_DEFAULT) / LG_OBP_DEFAULT, -0.4), 0.4)
-    rbi_l = (stat.get("rbi", 0) / spa) * (0.6 + 0.4 * park_run) * whip_factor * traffic_factor * pa
+    rbi_l = (stat.get("rbi", 0) / spa) * (0.6 + 0.4 * park_run) * whip_factor * traffic_factor * platoon_damped * pa
 
     support_factor = 1.0 + 0.5 * min(max((behind_slg - LG_SLG_DEFAULT) / LG_SLG_DEFAULT, -0.4), 0.4)
-    run_l = (stat.get("runs", 0) / spa) * (0.6 + 0.4 * park_run) * whip_factor * support_factor * pa
+    run_l = (stat.get("runs", 0) / spa) * (0.6 + 0.4 * park_run) * whip_factor * support_factor * platoon_damped * pa
 
     ab_est = pa * 0.89  # rough PA->AB conversion; ~11% of PA are walks/HBP/sac
     power_factor = 1.0 + 0.5 * min(max((opp_hr9 - LG_HR9) / LG_HR9, -0.3), 0.3)
     tb_park = 0.6 * park_hr + 0.4 * park_run
-    tb_l = stat.get("slg", LG_SLG_DEFAULT) * ab_est * k_factor * power_factor * tb_park
+    tb_l = stat.get("slg", LG_SLG_DEFAULT) * ab_est * k_factor * power_factor * tb_park * platoon
 
     return {"batter_home_runs": hr_l, "batter_hits": hit_l,
             "batter_rbis": rbi_l, "batter_runs_scored": run_l,
@@ -1207,6 +1541,8 @@ def build_prop_edges(sel_date, max_games=6):
         return None, meta, "No batter stats available."
     name_map = {str(n).lower(): row for n, row in zip(bat["name"], bat.to_dict("records"))}
     stat_by_id = {int(r["player_id"]): r for r in bat.to_dict("records") if r.get("player_id")}
+    bats_map, throws_map = fetch_player_handedness(sel_date.year)
+    recent_map = fetch_recent_form(sel_date.year, str(sel_date))
 
     def norm(s): return (s or "").lower().strip()
     sched_index = _index_by_teams([gm for _, gm in sched.iterrows()], "home_team", "away_team")
@@ -1248,7 +1584,9 @@ def build_prop_edges(sel_date, max_games=6):
 
         home_id = int(gm.get("home_team_id") or 0)
         away_id = int(gm.get("away_team_id") or 0)
-        park = PARK_FACTORS.get(home_id, NEUTRAL_PARK)
+        park = apply_weather_to_park(PARK_FACTORS.get(home_id, NEUTRAL_PARK),
+                                      fetch_weather(gm.get("venue", "")))
+        away_pid_p, home_pid_p = gm.get("away_prob_id"), gm.get("home_prob_id")
         away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
         home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
         order_map = {}
@@ -1291,8 +1629,13 @@ def build_prop_edges(sel_date, max_games=6):
                 order = order_map.get(pid, 5)
                 ahead_obp, behind_slg = _lineup_context(
                     order, lineup_by_team.get(tid, {}), stat_by_id)
-                lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9, opp_whip,
-                                           ahead_obp, behind_slg, park["hr"], park["run"])
+                opp_pid = away_pid_p if tid == home_id else (home_pid_p if tid == away_id else None)
+                pf_platoon = platoon_factor(bats_map.get(pid),
+                                            throws_map.get(int(opp_pid)) if opp_pid else None)
+                srow_eff = blend_recent_form(srow, recent_map.get(pid))
+                lam = prop_expected_counts(srow_eff, expected_pa(order), opp_hr9, opp_k9, opp_whip,
+                                           ahead_obp, behind_slg, park["hr"], park["run"],
+                                           platoon=pf_platoon)
                 mp = _p_over_line(lam[mkey], od["point"])
                 if mp is not None:
                     mp = _calibration_adjust(mp, LABEL[mkey])
@@ -1446,6 +1789,8 @@ def build_most_likely(sel_date, max_games=15):
     if bat.empty:
         return None, "No batter stats available."
     stat_by_id = {int(r["player_id"]): r for r in bat.to_dict("records") if r.get("player_id")}
+    bats_map, throws_map = fetch_player_handedness(sel_date.year)
+    recent_map = fetch_recent_form(sel_date.year, str(sel_date))
     LABEL = {"batter_home_runs": "Home Run", "batter_hits": "Hits",
              "batter_rbis": "RBI", "batter_runs_scored": "Runs"}
     rows, n, no_lineups = [], 0, 0
@@ -1454,7 +1799,8 @@ def build_most_likely(sel_date, max_games=15):
             break
         hid = int(gm.get("home_team_id") or 0)
         aid = int(gm.get("away_team_id") or 0)
-        park = PARK_FACTORS.get(hid, NEUTRAL_PARK)
+        park = apply_weather_to_park(PARK_FACTORS.get(hid, NEUTRAL_PARK),
+                                      fetch_weather(gm.get("venue", "")))
         away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
         home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
         try:
@@ -1464,11 +1810,13 @@ def build_most_likely(sel_date, max_games=15):
         gl = f"{TEAM_ABBR.get(aid, gm.get('away_team'))} @ {TEAM_ABBR.get(hid, gm.get('home_team'))}{_dh_suffix(gm)}"
         start = gm.get("game_time_bst", "")
         had = False
-        for side, opp_sp in (("home", away_sp), ("away", home_sp)):
+        for side, opp_sp, opp_pid_ml in (("home", away_sp, gm.get("away_prob_id")),
+                                          ("away", home_sp, gm.get("home_prob_id"))):
             d = lu.get(side)
             if d is None or d.empty:
                 continue
             had = True
+            opp_hand = throws_map.get(int(opp_pid_ml)) if opp_pid_ml else None
             opp_hr9 = float(opp_sp.get("homeRunsPer9", LG_HR9) or LG_HR9)
             opp_k9 = float(opp_sp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
             opp_whip = float(opp_sp.get("whip", LG_WHIP) or LG_WHIP)
@@ -1486,9 +1834,13 @@ def build_most_likely(sel_date, max_games=15):
                 if (srow.get("plateAppearances") or 0) < MIN_PA_FOR_RANKING:
                     continue  # too small a sample — season rates would be mostly noise
                 order = int(pr.get("order", 5) or 5)
+                _bpid = int(pr["player_id"])
                 ahead_obp, behind_slg = _lineup_context(order, slot_to_pid, stat_by_id)
-                lam = prop_expected_counts(srow, expected_pa(order), opp_hr9, opp_k9, opp_whip,
-                                           ahead_obp, behind_slg, park["hr"], park["run"])
+                pf_platoon = platoon_factor(bats_map.get(_bpid), opp_hand)
+                srow_eff = blend_recent_form(srow, recent_map.get(_bpid))
+                lam = prop_expected_counts(srow_eff, expected_pa(order), opp_hr9, opp_k9, opp_whip,
+                                           ahead_obp, behind_slg, park["hr"], park["run"],
+                                           platoon=pf_platoon)
                 probs = {}
                 player_name = pr.get("name") or srow.get("name")
                 for mkey, lbl in LABEL.items():
