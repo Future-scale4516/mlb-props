@@ -37,9 +37,19 @@ MIN_PA_FOR_RECENT_FORM = 20  # below this, the recent window is too thin to use
 # the earlier hand-set ones, kept so behaviour doesn't change until refitted.
 # shrink=0 means "no correction, this market is already well calibrated".
 CALIBRATION_FITS = {
-    "RBI":  {"base": 0.280, "shrink": 0.300},
-    "Runs": {"base": 0.360, "shrink": 0.180},
-    # Hits, Home Run, Total Bases: no correction applied yet.
+    # Fitted from real tracked results (2 slates: 2026-07-22 and 2026-07-26,
+    # ~2,570 graded Most-Likely picks). Each market shrinks the raw model
+    # probability toward a fixed long-run base rate:
+    #     adjusted = raw*(1 - shrink) + base*shrink
+    # These are provisional — regenerate with "Fit calibration from backtest"
+    # on the Backtest page as more result nights accumulate (fit_calibration()
+    # weights by sample size, so more nights = more trustworthy numbers). Two
+    # slates is enough to see the direction clearly but not to lock these in.
+    "Hits":        {"base": 0.55, "shrink": 0.59},  # was ~well-calibrated (ratio 0.95); light touch
+    "Runs":        {"base": 0.33, "shrink": 0.78},  # mild overconfidence (ratio 0.87)
+    "RBI":         {"base": 0.24, "shrink": 0.73},  # consistent overconfidence both nights (ratio 0.76)
+    "Total Bases": {"base": 0.28, "shrink": 0.68},  # worst market; ALSO gets a distribution fix (see prop_expected_counts)
+    "Home Run":    {"base": 0.10, "shrink": 0.37},  # thin sample (94 picks) + swung 0.62->0.97 across nights; light, provisional
 }
 
 BALLPARKS = {
@@ -1172,6 +1182,7 @@ def _total_reason(home_rpg, away_rpg, home_era, away_era, park, side,
 
 def build_game_edges(sel_date, odds_override=None, meta_override=None):
     """Match today's games to UK odds, run the model, return (df, note, meta)."""
+    refresh_league_averages(sel_date.year)  # current league baselines, not stale constants
     sched = fetch_schedule(str(sel_date))
     if sched.empty:
         return None, "No games scheduled for this date.", {}
@@ -1323,12 +1334,150 @@ LG_SLG_DEFAULT = 0.400  # league avg slugging, used for "run producers behind" c
 
 
 def _p_over_line(expected_count, point):
-    """P(count > point) via Poisson(expected_count). point like 0.5 / 1.5 / 2.5."""
+    """P(count > point) via Poisson(expected_count). point like 0.5 / 1.5 / 2.5.
+
+    Correct for genuine COUNT markets — HR, hits, RBI, runs — where each event is
+    a discrete +1 that arrives roughly independently across a game. Do NOT use it
+    for Total Bases: bases don't arrive as independent +1 events (one home run is
+    +4 at once) and are capped by the batter's ~4 at-bats, so a Poisson badly
+    over-weights the tail. Use p_total_bases_over() for that market instead.
+    """
     if point is None or expected_count is None:
         return None
     need = int(math.floor(point)) + 1
     cum = sum(_pois_pmf(i, expected_count) for i in range(need))
     return max(0.0, min(1.0, 1.0 - cum))
+
+
+# Share of a batter's hits that are singles / doubles / triples / home runs,
+# league-wide. Used to turn "expected total bases" into a real per-at-bat base
+# distribution rather than pretending bases trickle in one Poisson event at a
+# time. Roughly the long-run MLB hit-type split; refined by fit if needed.
+LG_HIT_TYPE_SPLIT = {1: 0.62, 2: 0.20, 3: 0.02, 4: 0.16}  # 1B, 2B, 3B, HR shares
+LG_TB_PER_HIT = sum(bases * share for bases, share in LG_HIT_TYPE_SPLIT.items())  # ~1.72
+
+
+def p_total_bases_over(exp_tb, point, ab=4.0):
+    """P(total bases > point) for one batter in one game, modelled properly.
+
+    The old approach fed `exp_tb` (a continuous expectation like 1.4 bases) into a
+    Poisson P(>=2), which assumes bases arrive as many independent +1 events. They
+    don't: a single swing yields 0/1/2/3/4 bases at once, and the whole total is
+    capped by ~4 at-bats. That mis-shape put far too much probability in the 2+
+    tail and was the single biggest source of Total-Bases overconfidence in the
+    tracked results.
+
+    Instead: split `exp_tb` across `ab` at-bats. Each at-bat independently either
+    produces no bases (an out) or a hit worth 1/2/3/4 bases in the league hit-type
+    proportions. We derive the per-at-bat hit probability `h` from
+    exp_tb = ab * h * TB_per_hit, then enumerate the exact P(0 total) and
+    P(1 total) and return 1 - those for the standard 1.5 (i.e. "2+") line. For
+    other points we fall back to a short convolution over at-bat outcomes.
+    """
+    if point is None or exp_tb is None or exp_tb <= 0:
+        return None
+    ab_int = max(1, int(round(ab)))
+    h = exp_tb / (ab_int * LG_TB_PER_HIT)
+    h = min(max(h, 0.0), 0.95)  # per-AB probability of getting a hit at all
+
+    # Per-at-bat base-count distribution: P(0 bases)=1-h, then h split by hit type.
+    per_ab = {0: 1.0 - h}
+    for bases, share in LG_HIT_TYPE_SPLIT.items():
+        per_ab[bases] = h * share
+
+    # Convolve `ab_int` independent at-bats into a total-bases distribution.
+    dist = {0: 1.0}
+    for _ in range(ab_int):
+        nxt = {}
+        for tot, ptot in dist.items():
+            for bases, pb in per_ab.items():
+                nxt[tot + bases] = nxt.get(tot + bases, 0.0) + ptot * pb
+        dist = nxt
+
+    need = int(math.floor(point)) + 1
+    p_at_least = sum(p for tot, p in dist.items() if tot >= need)
+    return max(0.0, min(1.0, p_at_least))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _league_averages_cached(season):
+    """Cached wrapper so the league-average API call happens at most once a day."""
+    return compute_league_pitching_averages(season)
+
+
+def refresh_league_averages(season):
+    """Update the module-level LG_* pitching constants from the season's real data.
+    Call once at the start of any build so every downstream model uses current
+    league baselines instead of the hardcoded fallbacks. Safe to call repeatedly —
+    the underlying fetch is cached for a day, and any stat that can't be computed
+    keeps its existing value. Returns the dict actually applied, for display."""
+    global LG_HR9, LG_K9, LG_WHIP, LEAGUE_ERA_DEFAULT
+    avgs = _league_averages_cached(season)
+    # Only overwrite with sane, positive numbers — never let a bad fetch zero these.
+    if avgs.get("hr9", 0) > 0:
+        LG_HR9 = avgs["hr9"]
+    if avgs.get("k9", 0) > 0:
+        LG_K9 = avgs["k9"]
+    if avgs.get("whip", 0) > 0:
+        LG_WHIP = avgs["whip"]
+    if avgs.get("era", 0) > 0:
+        LEAGUE_ERA_DEFAULT = avgs["era"]
+    return avgs
+
+
+def _prop_prob(market_key, lam_dict, point):
+    """Single entry point for turning a batter's expected-count vector into a
+    P(over the line) for a given prop market. Total Bases uses the compound
+    per-at-bat model (bases arrive in clumps, capped by at-bats); every other
+    market is a genuine count and uses the Poisson. Callers should use this
+    rather than calling _p_over_line directly, so the TB special-case can never
+    be forgotten at one of the several call sites."""
+    if market_key == "batter_total_bases":
+        return p_total_bases_over(lam_dict["batter_total_bases"], point)
+    return _p_over_line(lam_dict.get(market_key), point)
+
+
+def compute_league_pitching_averages(season):
+    """Compute league-wide HR/9, K/9, WHIP and ERA from the season's actual
+    pitching data, instead of relying on the hardcoded LG_* constants. Returns a
+    dict; any stat that can't be computed falls back to its hardcoded default so
+    this can never make things worse than the frozen constants did.
+
+    Why this exists: the MLB Stats API gives per-player and per-team stats, but
+    NOT league baselines — those were hand-typed constants (LG_HR9=1.15 etc.) that
+    never updated as the season moved. Every prop's pitcher adjustment is measured
+    relative to these baselines, so a stale baseline biases every pick. Computing
+    them from the same data we already pull keeps them honest and current.
+    """
+    fallback = {"hr9": LG_HR9, "k9": LG_K9, "whip": LG_WHIP, "era": LEAGUE_ERA_DEFAULT}
+    try:
+        data = safe_get("https://statsapi.mlb.com/api/v1/stats", {
+            "stats": "season", "group": "pitching", "season": season,
+            "sportId": 1, "playerPool": "ALL", "limit": 3000,
+        })
+        splits = data.get("stats", [{}])[0].get("splits", [])
+        if not splits:
+            return fallback
+        tot_hr = tot_so = tot_bb = tot_h = tot_er = tot_outs = 0.0
+        for s in splits:
+            stt = s.get("stat", {})
+            tot_hr += float(stt.get("homeRuns") or 0)
+            tot_so += float(stt.get("strikeOuts") or 0)
+            tot_bb += float(stt.get("baseOnBalls") or 0)
+            tot_h += float(stt.get("hits") or 0)
+            tot_er += float(stt.get("earnedRuns") or 0)
+            tot_outs += _ip_to_outs(stt.get("inningsPitched"))
+        ip = tot_outs / 3.0
+        if ip <= 0:
+            return fallback
+        return {
+            "hr9": round(tot_hr * 9 / ip, 3),
+            "k9": round(tot_so * 9 / ip, 3),
+            "whip": round((tot_bb + tot_h) / ip, 3),
+            "era": round(tot_er * 9 / ip, 3),
+        }
+    except Exception:
+        return fallback
 
 
 def expected_pa(order):
@@ -1665,6 +1814,7 @@ def build_prop_edges(sel_date, max_games=6, snapshot_by_event=None,
                      odds_override=None, meta_override=None):
     """Full slate prop edges: per-game props adjusted for the opposing starter and
     ballpark. Returns (df, meta, note). Green+amber only (edge 2-15) is filtered in UI."""
+    refresh_league_averages(sel_date.year)  # current league baselines, not stale constants
     sched = fetch_schedule(str(sel_date))
     if sched.empty:
         return None, {}, "No games scheduled for this date."
@@ -1784,7 +1934,7 @@ def build_prop_edges(sel_date, max_games=6, snapshot_by_event=None,
                 lam = prop_expected_counts(srow_eff, expected_pa(order), opp_hr9, opp_k9, opp_whip,
                                            ahead_obp, behind_slg, park["hr"], park["run"],
                                            platoon=pf_platoon)
-                mp = _p_over_line(lam[mkey], od["point"])
+                mp = _prop_prob(mkey, lam, od["point"])
                 if mp is not None:
                     mp = _calibration_adjust(mp, LABEL[mkey])
                 bp, mode = market_prob(od["over"], od["under"])
@@ -1930,6 +2080,7 @@ def suggest_stakes(bankroll, markets_with_bets):
 def build_most_likely(sel_date, max_games=15):
     """Rank batters by the model's raw probability of recording >=1 of each prop
     market (no odds, no quota), using confirmed lineups, opposing starter and park."""
+    refresh_league_averages(sel_date.year)  # current league baselines, not stale constants
     sched = fetch_schedule(str(sel_date))
     if sched.empty:
         return None, "No games scheduled for this date."
@@ -2044,6 +2195,7 @@ def _calib(recs, market):
 def run_backtest(sel_date, days_back=14):
     """Score the game model against real final scores from recent completed games.
     Returns (records, days_with_games) where each record is (market, pred_prob, outcome)."""
+    refresh_league_averages(sel_date.year)  # match the baselines live builds use
     team_off, league_rpg = fetch_team_offense(sel_date.year)
     bullpen_era = fetch_bullpen_era(sel_date.year)
     recs, days_done = [], 0
@@ -2271,12 +2423,55 @@ def build_priced_results(sel_date, max_games=8, lead_minutes=60):
     pdf, pmeta, pnote = build_prop_edges(sel_date, max_games,
                                          snapshot_by_event=snap_by_event,
                                          odds_override=odds, meta_override=ometa)
+
+    # ALSO reconstruct + grade game-line picks (Moneyline / Run line / Total)
+    # from the SAME historical odds fetch. Reusing the odds we already paid for
+    # means this adds zero Odds API cost — just the free MLB final-score lookup.
+    gdf, gnote, _ = build_game_edges(sel_date,
+                                     odds_override=odds, meta_override=ometa)
+    finals = fetch_results(str(sel_date))
+    final_by_gpk = {f["gamePk"]: f for f in finals}
+    game_rows = []
+    if isinstance(gdf, pd.DataFrame) and not gdf.empty:
+        for _, r in gdf.iterrows():
+            gp = r.get("GamePk")
+            fin = final_by_gpk.get(int(gp)) if gp else None
+            if not fin:
+                continue  # game not completed yet
+            hs, as_ = int(fin["home_score"]), int(fin["away_score"])
+            mkt = r["Market"]
+            side = r.get("Side")
+            hit = None
+            if mkt == "Moneyline":
+                hit = (hs > as_) if side == "home" else (as_ > hs)
+            elif mkt == "Run line":
+                hit = ((hs - as_) >= 2) if side == "home" else ((as_ - hs) >= 2)
+            elif mkt == "Total":
+                tot, ln = hs + as_, float(r.get("Threshold") or 0)
+                direction = r.get("Direction")
+                if direction == "Over":
+                    hit = tot > ln
+                elif direction == "Under":
+                    hit = tot < ln
+            if hit is None:
+                continue
+            odds_dec = float(r.get("Odds") or 0)
+            pl = (odds_dec - 1.0) if hit else -1.0
+            game_rows.append({
+                "Market": mkt, "Light": classify_pick(r["Edge"], r["Model %"], mkt),
+                "Player": r["Selection"], "Game": r["Game"], "Line": r.get("Threshold") or "",
+                "Model %": r["Model %"], "Market %": r["Fair %"], "Edge": r["Edge"],
+                "Odds": odds_dec, "Actual": f"{as_}-{hs}", "Hit": bool(hit),
+                "P/L (1u)": round(pl, 2), "Reason": r.get("Reason", ""),
+            })
+
     cost = {"snapshots": snaps,
             "game_line_credits": ometa.get("credits_estimate", 0),
             "prop_games": min(max_games, len(odds)),
-            "remaining": pmeta.get("remaining") if pmeta else ometa.get("remaining")}
-    if pdf is None or pdf.empty:
-        return None, (pnote or "No qualifying value picks found for that date."), cost
+            "remaining": pmeta.get("remaining") if pmeta else ometa.get("remaining"),
+            "game_picks_graded": len(game_rows)}
+    if (pdf is None or pdf.empty) and not game_rows:
+        return None, (pnote or gnote or "No qualifying value picks found for that date."), cost
 
     ACTUAL_KEY = {"batter_home_runs": "hr", "batter_hits": "hits",
                   "batter_rbis": "rbi", "batter_runs_scored": "runs",
@@ -2311,10 +2506,111 @@ def build_priced_results(sel_date, max_games=8, lead_minutes=60):
             "P/L (1u)": round(pl, 2), "Reason": r.get("Reason", ""),
         })
 
-    if not rows:
-        return None, ("Picks were reconstructed, but no matching box-score lines were "
+    all_rows = rows + game_rows
+    if not all_rows:
+        return None, ("Picks were reconstructed, but no matching results were "
                       "found — the games may not have completed yet."), cost
-    return pd.DataFrame(rows), f"Reconstructed and scored {len(rows)} value picks.", cost
+    summary = f"Reconstructed and scored {len(rows)} prop picks and {len(game_rows)} game-line picks."
+    return pd.DataFrame(all_rows), summary, cost
+
+
+def build_game_results(sel_date):
+    """Score the model's game-line predictions for ONE date against real final scores.
+    Returns (df, note).
+
+    Same idea and same limitation as build_prop_results: The Odds API doesn't
+    serve historical prices, so this reconstructs the MODEL's own read (Moneyline
+    home/away win prob, Run Line -1.5/+1.5 cover prob, Total over/under prob)
+    from the real starters, real bullpens and real park, then checks it against
+    the real final score. It answers \"was the model's game-level read right?\",
+    not \"what odds were available at the time?\" — for that use build_priced_results
+    which now also grades game bets when historical odds are on the plan.
+
+    Output columns mirror build_prop_results so the same downstream export/CSV
+    logic works: Result, Market, Selection, Line, Model %, Actual, Game, Score.
+    Selection covers both sides (e.g. two Moneyline rows per game, one per team),
+    so the tracked hit rate reflects every prediction the model made, not just
+    the favored side."""
+    refresh_league_averages(sel_date.year)
+    results = fetch_results(str(sel_date))
+    if not results:
+        return None, ("No completed games on this date yet — game-line results "
+                      "appear once games finish.")
+    team_off, league_rpg = fetch_team_offense(sel_date.year)
+    bullpen_era = fetch_bullpen_era(sel_date.year)
+
+    rows = []
+    for r in results:
+        hid = int(r.get("home_team_id") or 0)
+        aid = int(r.get("away_team_id") or 0)
+        if not hid or not aid:
+            continue
+        hs, as_ = int(r.get("home_score") or 0), int(r.get("away_score") or 0)
+
+        pf = PARK_FACTORS.get(hid, NEUTRAL_PARK)
+        home_rpg = _park_neutral_rpg(team_off.get(hid, league_rpg), pf["run"])
+        away_rpg = _park_neutral_rpg(team_off.get(aid, league_rpg),
+                                     PARK_FACTORS.get(aid, NEUTRAL_PARK)["run"])
+        away_sp = fetch_pitcher_stats(r.get("away_prob_id"))
+        home_sp = fetch_pitcher_stats(r.get("home_prob_id"))
+        away_bp = bullpen_era.get(aid, LEAGUE_BULLPEN_ERA_DEFAULT)
+        home_bp = bullpen_era.get(hid, LEAGUE_BULLPEN_ERA_DEFAULT)
+
+        # No historical total line available from The Odds API, so use the
+        # league-neutral 8.5 for a totals reconstruction. It's a rough anchor
+        # rather than the real closing line, but it's consistent across dates.
+        mdl = model_game(home_rpg, away_rpg,
+                         away_sp.get("era", 4.5), home_sp.get("era", 4.5),
+                         league_rpg, LEAGUE_ERA_DEFAULT, total_line=8.5,
+                         park=pf["run"],
+                         home_opp_bullpen_era=away_bp, away_opp_bullpen_era=home_bp)
+
+        home_ab = TEAM_ABBR.get(hid, r.get("home_team", "HOME"))
+        away_ab = TEAM_ABBR.get(aid, r.get("away_team", "AWAY"))
+        gl = f"{away_ab} @ {home_ab}"
+        score_txt = f"{as_}-{hs}"
+
+        # Moneyline — both sides. Exactly one wins.
+        home_won = 1 if hs > as_ else 0
+        away_won = 1 if as_ > hs else 0
+        rows.append({"Result": "✅" if home_won else "❌", "Market": "Moneyline",
+                     "Selection": home_ab, "Line": "ML",
+                     "Model %": round(mdl["p_home_ml"] * 100, 1),
+                     "Actual": home_won, "Game": gl, "Score": score_txt})
+        rows.append({"Result": "✅" if away_won else "❌", "Market": "Moneyline",
+                     "Selection": away_ab, "Line": "ML",
+                     "Model %": round(mdl["p_away_ml"] * 100, 1),
+                     "Actual": away_won, "Game": gl, "Score": score_txt})
+
+        # Run line — home -1.5 / away +1.5. Exactly one covers by 2+.
+        home_covered = 1 if (hs - as_) >= 2 else 0
+        away_covered = 1 if (as_ - hs) >= 2 else 0
+        rows.append({"Result": "✅" if home_covered else "❌", "Market": "Run line",
+                     "Selection": f"{home_ab} -1.5", "Line": "-1.5",
+                     "Model %": round(mdl["p_home_cover"] * 100, 1),
+                     "Actual": home_covered, "Game": gl, "Score": score_txt})
+        rows.append({"Result": "✅" if away_covered else "❌", "Market": "Run line",
+                     "Selection": f"{away_ab} +1.5", "Line": "+1.5",
+                     "Model %": round(mdl["p_away_cover"] * 100, 1),
+                     "Actual": away_covered, "Game": gl, "Score": score_txt})
+
+        # Total — over/under 8.5 (the anchor line the model was run at)
+        tot = hs + as_
+        over_hit = 1 if tot > 8.5 else 0
+        under_hit = 1 if tot < 8.5 else 0  # tot==8.5 impossible with integer scores
+        rows.append({"Result": "✅" if over_hit else "❌", "Market": "Total",
+                     "Selection": "Over 8.5", "Line": "O8.5",
+                     "Model %": round(mdl["p_over"] * 100, 1),
+                     "Actual": over_hit, "Game": gl, "Score": score_txt})
+        rows.append({"Result": "✅" if under_hit else "❌", "Market": "Total",
+                     "Selection": "Under 8.5", "Line": "U8.5",
+                     "Model %": round(mdl["p_under"] * 100, 1),
+                     "Actual": under_hit, "Game": gl, "Score": score_txt})
+
+    if not rows:
+        return None, "No game results could be reconstructed."
+    df = pd.DataFrame(rows)
+    return df, f"Scored {len(df)} game-line predictions across {len(results)} completed games."
 
 
 def build_prop_results(sel_date, max_games=None):
@@ -2417,8 +2713,9 @@ def build_prop_results(sel_date, max_games=None):
                     "Actual": actual, "Hit": bool(actual >= 1),
                 })
             # Total Bases is judged at 2+ (a single already gives 1 TB, so a
-            # 1+ line would just duplicate the Hits market)
-            p_tb = _p_over_line(lam["batter_total_bases"], 1.5)
+            # 1+ line would just duplicate the Hits market). Uses the compound
+            # per-at-bat model, not Poisson — see p_total_bases_over.
+            p_tb = _prop_prob("batter_total_bases", lam, 1.5)
             if p_tb is not None:
                 actual_tb = b.get("total_bases", 0)
                 rows.append({
@@ -2508,8 +2805,9 @@ def run_prop_backtest(sel_date, days_back=14, max_games_per_day=None):
                     recs.append(("Runs+Hits+RBI (1+)", min(p_combo, 0.999), outcome_combo))
                 # Total Bases tested at a 1.5 line (i.e. 2+ bases) rather than 0.5 —
                 # any single already counts as 1 TB, so a 0.5 threshold would just
-                # duplicate the Hits market and tell us nothing new.
-                p_tb = _p_over_line(lam["batter_total_bases"], 1.5)
+                # duplicate the Hits market and tell us nothing new. Uses the
+                # compound per-at-bat model, not Poisson — see p_total_bases_over.
+                p_tb = _prop_prob("batter_total_bases", lam, 1.5)
                 if p_tb is not None:
                     outcome_tb = 1 if b["total_bases"] > 1.5 else 0
                     recs.append(("Total Bases (2+)", p_tb, outcome_tb))
