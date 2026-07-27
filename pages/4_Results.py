@@ -7,9 +7,19 @@ setup_page("MLB Prop Analyser — Results")
 sel_date = sidebar_date()
 
 st.title("📋 Results")
-st.caption("How the model's player-prop predictions actually turned out for the selected "
-           "date — what it projected for each batter, what they actually did, and whether "
-           "it landed. Free MLB data, no Odds API quota used.")
+st.caption("How the model's predictions actually turned out for the selected date — what it "
+           "projected, what actually happened, and whether it landed. Covers both player "
+           "props and game bets (Moneyline / Run line / Total). Free MLB data, no Odds API "
+           "quota used in the model-only modes.")
+
+bet_type = st.radio(
+    "Bet type",
+    ["Player props", "Game bets"],
+    horizontal=True,
+    help="Player props scores the model's per-batter predictions. Game bets scores its "
+         "per-game predictions (Moneyline, Run line, Total). Two separate pipelines that "
+         "use different data — the results shown reflect only the type you pick here.")
+is_game = bet_type == "Game bets"
 
 mode = st.radio(
     "Results mode",
@@ -35,22 +45,31 @@ if priced:
 else:
     with st.expander("Why this mode can't show edges or prices", expanded=False):
         st.markdown("""
-This mode rebuilds only the **model's own probability** for each batter, using the real
-lineup and starter from that game, and checks it against the box score. It answers
-*"were the model's reads right?"* — it doesn't know what price was on offer.
+This mode rebuilds only the **model's own probability** for each pick, using the real
+lineup, starter and (for game bets) real final score, and checks it against the outcome.
+It answers *"were the model's reads right?"* — it doesn't know what price was on offer.
 
 Switch to **Priced-up picks** for the real edge, traffic-light colour and odds. That
 uses the historical odds endpoint, which costs credits but gives you genuine
 closed-loop tracking: what the model flagged, at what price, and whether it landed.
 """)
 
-st.caption("Game bets aren't included here — you track those separately.")
-
 if st.button("Load results"):
-    with st.spinner("Rebuilding picks and checking them against box scores..."):
+    with st.spinner("Rebuilding picks and checking them against results..."):
         if priced:
             rdf, rnote, rcost = build_priced_results(sel_date, max_games=max_g)
             st.session_state["results_cost"] = rcost
+            # build_priced_results returns props AND game bets combined. Filter
+            # to just the type the user's asking about, so the on-page numbers
+            # (hit rate, P/L, per-market tabs) match the selection.
+            if rdf is not None and not rdf.empty:
+                if is_game:
+                    rdf = rdf[rdf["Market"].isin(["Moneyline", "Run line", "Total"])].reset_index(drop=True)
+                else:
+                    rdf = rdf[~rdf["Market"].isin(["Moneyline", "Run line", "Total"])].reset_index(drop=True)
+        elif is_game:
+            rdf, rnote = build_game_results(sel_date)
+            st.session_state["results_cost"] = None
         else:
             rdf, rnote = build_prop_results(sel_date)
             st.session_state["results_cost"] = None
@@ -58,6 +77,7 @@ if st.button("Load results"):
     st.session_state["results_note"] = rnote
     st.session_state["results_for_date"] = str(sel_date)
     st.session_state["results_priced"] = priced
+    st.session_state["results_bet_type"] = bet_type
 
 rdf = st.session_state.get("results_df")
 if st.session_state.get("results_for_date") == str(sel_date) and rdf is not None:
@@ -105,7 +125,8 @@ if st.session_state.get("results_for_date") == str(sel_date) and rdf is not None
                    "normal variance, not a verdict on the model. The Backtest page is "
                    "where calibration is judged properly, over many days.")
 
-        MARKETS = ["Home Run", "Hits", "RBI", "Runs", "Total Bases"]
+        MARKETS = (["Moneyline", "Run line", "Total"] if is_game
+                   else ["Home Run", "Hits", "RBI", "Runs", "Total Bases"])
         tabs = st.tabs([f"📊 All"] + [f"{mk}" for mk in MARKETS])
 
         def show_results_table(tab, market=None):
@@ -145,10 +166,11 @@ if st.session_state.get("results_for_date") == str(sel_date) and rdf is not None
         for tab, mk in zip(tabs[1:], MARKETS):
             show_results_table(tab, mk)
 
+        _kind = "game_bets" if is_game else "props"
         st.download_button(
             "Download results CSV",
             data=sub_all.to_csv(index=False).encode("utf-8"),
-            file_name=f"mlb_prop_results_{sel_date}.csv", mime="text/csv")
+            file_name=f"mlb_{_kind}_results_{sel_date}.csv", mime="text/csv")
 elif st.session_state.get("results_for_date") == str(sel_date):
     st.warning(st.session_state.get("results_note", "No results available."))
 else:
