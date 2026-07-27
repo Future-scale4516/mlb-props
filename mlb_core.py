@@ -37,19 +37,27 @@ MIN_PA_FOR_RECENT_FORM = 20  # below this, the recent window is too thin to use
 # the earlier hand-set ones, kept so behaviour doesn't change until refitted.
 # shrink=0 means "no correction, this market is already well calibrated".
 CALIBRATION_FITS = {
-    # Fitted from real tracked results (2 slates: 2026-07-22 and 2026-07-26,
-    # ~2,570 graded Most-Likely picks). Each market shrinks the raw model
-    # probability toward a fixed long-run base rate:
-    #     adjusted = raw*(1 - shrink) + base*shrink
-    # These are provisional — regenerate with "Fit calibration from backtest"
-    # on the Backtest page as more result nights accumulate (fit_calibration()
-    # weights by sample size, so more nights = more trustworthy numbers). Two
-    # slates is enough to see the direction clearly but not to lock these in.
-    "Hits":        {"base": 0.55, "shrink": 0.59},  # was ~well-calibrated (ratio 0.95); light touch
-    "Runs":        {"base": 0.33, "shrink": 0.78},  # mild overconfidence (ratio 0.87)
-    "RBI":         {"base": 0.24, "shrink": 0.73},  # consistent overconfidence both nights (ratio 0.76)
-    "Total Bases": {"base": 0.28, "shrink": 0.68},  # worst market; ALSO gets a distribution fix (see prop_expected_counts)
-    "Home Run":    {"base": 0.10, "shrink": 0.37},  # thin sample (94 picks) + swung 0.62->0.97 across nights; light, provisional
+    # Fitted using fit_calibration()'s own method (weighted decile-bucket
+    # regression, shrink capped at 0.60) on 2 slates: 2026-07-22 and 2026-07-26,
+    # ~2,570 graded Most-Likely picks. adjusted = raw*(1-shrink) + base*shrink.
+    #
+    # IMPORTANT: an earlier version of these numbers was fit by hand-solving
+    # for "shrink that makes the mean match", which bypasses fit_calibration's
+    # 0.60 safety cap and crushes variance along with bias — it made RBI (and
+    # to a lesser extent Runs/Total Bases) barely respond to the raw model %
+    # at all, which is why recommendations nearly disappeared. These values
+    # are back on the proper method. Always regenerate via "Fit calibration
+    # from backtest" on the Backtest page rather than solving by hand — two
+    # slates is enough to see direction, not to lock these in for good.
+    "Runs":        {"base": 0.28, "shrink": 0.42},  # slope 0.58 — real overconfidence, moderate correction
+    "RBI":         {"base": 0.19, "shrink": 0.52},  # slope 0.48 — the least reliable market bar HR; corrected but not flattened
+    "Total Bases": {"base": 0.24, "shrink": 0.56},  # ALSO gets a distribution fix (see p_total_bases_over)
+    # Hits: fitted slope was 1.07 (i.e. raw_shrink went slightly negative,
+    # capped at 0) — it was already well-calibrated, so no shrink is applied.
+    # Home Run: only 94 picks across 2 nights produced just 1 usable decile
+    # bucket — not enough to fit reliably (fit_calibration itself would refuse,
+    # needing 3+ bands). Left uncorrected until more nights accumulate; treat
+    # every HR pick as lower-confidence than its % suggests in the meantime.
 }
 
 BALLPARKS = {
@@ -368,12 +376,42 @@ def weather_multiplier(wx):
 
 
 def apply_weather_to_park(park, wx):
-    """Combine a park's static run/HR factors with today's weather."""
+    """Combine a park's static run/HR factors with today's weather.
+
+    Keeps the raw weather/venue details (venue, temp, wind, dome) on the
+    returned dict alongside the numeric "run"/"hr" multipliers, instead of
+    discarding them once the multiplier is computed. Every existing caller
+    that only reads park["hr"]/park["run"] is unaffected — this purely adds
+    keys. The extra keys let build_prop_edges/build_most_likely surface the
+    actual conditions (e.g. "82°F, wind 9mph out, Coors Field") instead of
+    only ever showing their numeric effect on the model."""
     m = weather_multiplier(wx)
-    return {"run": park.get("run", 1.0) * m, "hr": park.get("hr", 1.0) * m}
+    return {
+        "run": park.get("run", 1.0) * m,
+        "hr": park.get("hr", 1.0) * m,
+        "venue": wx.get("venue", ""),
+        "temp": wx.get("temp"),
+        "wind": wx.get("wind"),
+        "dome": wx.get("dome", False),
+    }
 
 
-def _safe_int(v):
+def _conditions_str(park):
+    """Turn the enriched park dict (see apply_weather_to_park) into a short
+    human-readable conditions string for display on a pick card, e.g.
+    '82°F · wind 9mph · Coors Field' or '🏟️ Dome · Yankee Stadium'."""
+    venue = park.get("venue") or ""
+    if park.get("dome"):
+        bits = ["🏟️ Dome"]
+    else:
+        bits = []
+        if park.get("temp") is not None:
+            bits.append(f"{int(round(park['temp']))}°F")
+        if park.get("wind") is not None:
+            bits.append(f"wind {int(round(park['wind']))}mph")
+    if venue:
+        bits.append(venue)
+    return " · ".join(bits) if bits else ""
     """int() that returns None instead of raising for NaN, None or junk.
 
     Needed because a TBD probable pitcher comes back from pandas as NaN — and
@@ -957,16 +995,27 @@ MARKET_EDGE_BANDS = {
     # number is grey (no signal), between 1st-2nd is green, 2nd-3rd is amber,
     # at/above the 3rd is red. Markets with a long, clean backtest track record
     # (Moneyline, Run line, Total, Hits) keep the original baseline bands.
-    # Runs and Total Bases have shown real overconfidence in backtests/results
-    # even after fixes, so they need a bigger edge to earn the same colour.
-    # RBI — the weakest market even with its calibration correction — needs the
-    # biggest edge of all. Home Run keeps baseline: its trust issue isn't edge
-    # size, it's inherent rarity, which is handled separately as a flagged
-    # lottery pick rather than by tightening these bands.
+    # Home Run keeps baseline: its trust issue isn't edge size, it's inherent
+    # rarity, which is handled separately as a flagged lottery pick rather than
+    # by tightening these bands.
+    #
+    # RBI and Total Bases both sit at baseline (2, 8, 15) now. Both were
+    # previously widened (RBI to (4,12,20), TB to (3,10,18)) to compensate for
+    # overconfidence — but CALIBRATION_FITS now corrects that overconfidence
+    # directly (fit properly via fit_calibration's bucketed regression, capped
+    # at 0.60 shrink). Keeping the wide band ON TOP of a working calibration
+    # double-corrected and suppressed nearly every pick in both markets. If a
+    # market is already honest, it doesn't also need a bigger goalpost.
+    #
+    # Runs keeps a modest widening: even after proper calibration its fit slope
+    # (0.58) was the second-weakest after RBI, so a slightly bigger edge is
+    # asked for before trusting it. Revisit alongside RBI once more nights of
+    # results come in — this whole set of bands is a rough placeholder, not a
+    # tuned system.
     "Moneyline": (2, 8, 15), "Run line": (2, 8, 15), "Total": (2, 8, 15),
-    "Hits": (2, 8, 15), "Home Run": (2, 8, 15),
-    "Runs": (3, 10, 18), "Total Bases": (3, 10, 18),
-    "RBI": (4, 12, 20),
+    "Hits": (2, 8, 15), "Home Run": (2, 8, 15), "Total Bases": (2, 8, 15),
+    "RBI": (2, 8, 15),
+    "Runs": (3, 10, 18),
 }
 
 MARKET_PROB_CEILING = {
@@ -1093,15 +1142,19 @@ def _dh_suffix(gm):
     return f" ({gn})" if dh in ("Y", "S") and gn else ""
 
 
-def render_pick_card(light, title, subtitle, metrics, reason=None):
+def render_pick_card(light, title, subtitle, metrics, reason=None, conditions=None):
     """Render one betting pick as a compact, mobile-friendly card instead of a
-    wide table row — a light+title header, one dense line of metrics, and an
-    optional reason caption underneath. `metrics` is a list of (label, value)
-    tuples joined into a single small-text line — deliberately NOT one
-    st.metric widget per value, since those are large KPI-style displays by
-    design and were the main driver of how much vertical space each card took.
-    Everything stacks vertically, avoiding the horizontal-scroll problem
-    st.dataframe has on narrow phone screens."""
+    wide table row — a light+title header, one dense line of metrics, and
+    optional reason/conditions captions underneath. `metrics` is a list of
+    (label, value) tuples joined into a single small-text line — deliberately
+    NOT one st.metric widget per value, since those are large KPI-style
+    displays by design and were the main driver of how much vertical space
+    each card took. Everything stacks vertically, avoiding the horizontal-
+    scroll problem st.dataframe has on narrow phone screens.
+
+    `conditions` is a short string like "82°F · wind 9mph · Coors Field" —
+    kept as its own line rather than folded into `reason`, so the matchup
+    rationale and the live conditions behind it stay visually distinct."""
     with st.container(border=True):
         header = f"{light} **{title}**" if light else f"**{title}**"
         st.markdown(header)
@@ -1110,6 +1163,8 @@ def render_pick_card(light, title, subtitle, metrics, reason=None):
         st.caption("  ·  ".join(f"{label}: {value}" for label, value in metrics))
         if reason:
             st.caption(reason)
+        if conditions:
+            st.caption(f"📍 {conditions}")
 
 
 def sort_picker(df, sort_options, key):
@@ -1692,13 +1747,34 @@ def consolidate_prop(event, market_key):
     return out
 
 
+# Typical bookmaker overround (vig) on a single-sided player prop line, when
+# we only have one side quoted and can't de-vig properly against its
+# opposite. This is an approximation, not a measured constant — but using it
+# is a lot closer to true fair value than using the raw vig-included price
+# outright, which is what was happening before.
+TYPICAL_PROP_OVERROUND = 0.06
+
+
 def market_prob(over_odds, under_odds):
-    """Fair P(over): de-vig if both sides quoted, else raw 1/over (vig included)."""
+    """Fair P(over): de-vig if both sides quoted, else back out an approximate
+    fair price from the single side using TYPICAL_PROP_OVERROUND, rather than
+    using the raw vig-included implied probability directly.
+
+    Why this matters: 1/odds on a single side includes the book's margin, so
+    it's a few points HIGHER than true fair value (typically 2-5 pts at normal
+    prop overrounds). Edge = model% - fair%, so treating that inflated number
+    as "fair" silently shrinks every genuine edge computed this way — exactly
+    the kind of gap that pushes a real signal into the "no signal" band. This
+    haircut is an approximation (we don't know the book's actual margin
+    without both sides), but it's much closer than not correcting at all.
+    """
     if over_odds and under_odds:
         fo, _ = devig_two(over_odds, under_odds)
         return fo, "de-vig"
     if over_odds:
-        return min(1 / over_odds, 0.999), "raw"
+        raw = min(1 / over_odds, 0.999)
+        approx_fair = raw / (1 + TYPICAL_PROP_OVERROUND)
+        return max(0.001, min(approx_fair, 0.999)), "raw (overround-adjusted)"
     return None, None
 
 
@@ -1844,7 +1920,7 @@ def build_prop_edges(sel_date, max_games=6, snapshot_by_event=None,
              "batter_rbis": "RBI", "batter_runs_scored": "Runs",
              "batter_total_bases": "Total Bases"}
     cols = ["Market", "Light", "Player", "Game", "Start", "Line",
-            "Model %", "Market %", "Edge", "Best over", "Reason",
+            "Model %", "Market %", "Edge", "Best over", "Reason", "Conditions",
             "GamePk", "PlayerID", "MarketKey", "Point"]
     rows, unmatched = [], []
     analysed, last_meta = 0, meta
@@ -1924,6 +2000,7 @@ def build_prop_edges(sel_date, max_games=6, snapshot_by_event=None,
                 opp_k9 = float(opp.get("strikeoutsPer9Inn", LG_K9) or LG_K9)
                 opp_whip = float(opp.get("whip", LG_WHIP) or LG_WHIP)
                 order = order_map.get(pid, 5)
+                lineup_confirmed = pid in order_map
                 ahead_obp, behind_slg = _lineup_context(
                     order, lineup_by_team.get(tid, {}), stat_by_id)
                 opp_pid = away_pid_p if tid == home_id else (home_pid_p if tid == away_id else None)
@@ -1945,11 +2022,15 @@ def build_prop_edges(sel_date, max_games=6, snapshot_by_event=None,
                 _lo, _mid, _hi = MARKET_EDGE_BANDS.get(mkt_label, (2, 8, 15))
                 if not (_lo <= edge < _hi):
                     continue
+                _cond = _conditions_str(park)
+                if not lineup_confirmed:
+                    _cond += " · ⏳ lineup not yet confirmed (assumed order)"
                 rows.append([mkt_label, classify_pick(edge, mp * 100, mkt_label),
                              player, gl, start, f"O{od['point']}",
                              round(mp * 100, 1), round(bp * 100, 1), round(edge, 1),
                              od["over_best"], _prop_reason(mkey, srow, opp_hr9, opp_k9, park,
                                                             order, ahead_obp, behind_slg),
+                             _cond,
                              gm.get("gamePk"), pid, mkey, od["point"]])
 
     note = f"Analysed {analysed} game(s)."
@@ -2149,22 +2230,22 @@ def build_most_likely(sel_date, max_games=15):
                         p = _calibration_adjust(p, lbl)
                     probs[mkey] = p
                     rows.append([lbl, player_name, gl, start,
-                                 int(order), round(p * 100, 1)])
+                                 int(order), round(p * 100, 1), _conditions_str(park)])
                 # combo: P(at least one of hits/runs/RBI >= 1)
                 cp = _combo_prob(probs)
                 if cp is not None:
                     rows.append(["Runs+Hits+RBI (1+)", player_name, gl, start,
-                                 int(order), round(cp * 100, 1)])
+                                 int(order), round(cp * 100, 1), _conditions_str(park)])
                 # Total Bases: expected value, not a "1+" probability (any hit is
                 # already >=1 TB, so a threshold framing would just duplicate Hits)
                 rows.append(["Total Bases (expected)", player_name, gl, start,
-                             int(order), round(lam["batter_total_bases"], 2)])
+                             int(order), round(lam["batter_total_bases"], 2), _conditions_str(park)])
         if not had:
             no_lineups += 1
         n += 1
     if not rows:
         return None, "No confirmed lineups posted yet for these games (try closer to first pitch)."
-    df = pd.DataFrame(rows, columns=["Market", "Player", "Game", "Start", "Order", "Value"])
+    df = pd.DataFrame(rows, columns=["Market", "Player", "Game", "Start", "Order", "Value", "Conditions"])
     note = f"Ranked batters across {n - no_lineups} game(s) with confirmed lineups."
     if no_lineups:
         note += f" {no_lineups} game(s) had no lineup posted yet."
@@ -2570,42 +2651,32 @@ def build_game_results(sel_date):
         gl = f"{away_ab} @ {home_ab}"
         score_txt = f"{as_}-{hs}"
 
+        # Shape matches build_prop_results so one Streamlit page can render both:
+        # Hit (bool), Player (the pick label), Market/Line/Model %/Actual/Game/Score.
+        def add(mkt, sel, line, model_p, hit):
+            rows.append({
+                "Market": mkt, "Player": sel, "Line": line,
+                "Model %": round(model_p * 100, 1),
+                "Actual": score_txt,          # game outcome is the score itself
+                "Hit": bool(hit),
+                "Game": gl, "Score": score_txt,
+            })
+
         # Moneyline — both sides. Exactly one wins.
-        home_won = 1 if hs > as_ else 0
-        away_won = 1 if as_ > hs else 0
-        rows.append({"Result": "✅" if home_won else "❌", "Market": "Moneyline",
-                     "Selection": home_ab, "Line": "ML",
-                     "Model %": round(mdl["p_home_ml"] * 100, 1),
-                     "Actual": home_won, "Game": gl, "Score": score_txt})
-        rows.append({"Result": "✅" if away_won else "❌", "Market": "Moneyline",
-                     "Selection": away_ab, "Line": "ML",
-                     "Model %": round(mdl["p_away_ml"] * 100, 1),
-                     "Actual": away_won, "Game": gl, "Score": score_txt})
+        add("Moneyline", home_ab, "ML", mdl["p_home_ml"], hs > as_)
+        add("Moneyline", away_ab, "ML", mdl["p_away_ml"], as_ > hs)
 
         # Run line — home -1.5 / away +1.5. Exactly one covers by 2+.
-        home_covered = 1 if (hs - as_) >= 2 else 0
-        away_covered = 1 if (as_ - hs) >= 2 else 0
-        rows.append({"Result": "✅" if home_covered else "❌", "Market": "Run line",
-                     "Selection": f"{home_ab} -1.5", "Line": "-1.5",
-                     "Model %": round(mdl["p_home_cover"] * 100, 1),
-                     "Actual": home_covered, "Game": gl, "Score": score_txt})
-        rows.append({"Result": "✅" if away_covered else "❌", "Market": "Run line",
-                     "Selection": f"{away_ab} +1.5", "Line": "+1.5",
-                     "Model %": round(mdl["p_away_cover"] * 100, 1),
-                     "Actual": away_covered, "Game": gl, "Score": score_txt})
+        add("Run line", f"{home_ab} -1.5", "-1.5", mdl["p_home_cover"], (hs - as_) >= 2)
+        add("Run line", f"{away_ab} +1.5", "+1.5", mdl["p_away_cover"], (as_ - hs) >= 2)
 
-        # Total — over/under 8.5 (the anchor line the model was run at)
+        # Total — over/under 8.5 (the anchor line the model was run at). No
+        # historical odds means we can't match each game's actual closing total,
+        # so we anchor at league-neutral 8.5 and grade against it — model % is
+        # meaningful in absolute terms, but "edge vs the book" isn't recoverable.
         tot = hs + as_
-        over_hit = 1 if tot > 8.5 else 0
-        under_hit = 1 if tot < 8.5 else 0  # tot==8.5 impossible with integer scores
-        rows.append({"Result": "✅" if over_hit else "❌", "Market": "Total",
-                     "Selection": "Over 8.5", "Line": "O8.5",
-                     "Model %": round(mdl["p_over"] * 100, 1),
-                     "Actual": over_hit, "Game": gl, "Score": score_txt})
-        rows.append({"Result": "✅" if under_hit else "❌", "Market": "Total",
-                     "Selection": "Under 8.5", "Line": "U8.5",
-                     "Model %": round(mdl["p_under"] * 100, 1),
-                     "Actual": under_hit, "Game": gl, "Score": score_txt})
+        add("Total", "Over 8.5", "O8.5", mdl["p_over"], tot > 8.5)
+        add("Total", "Under 8.5", "U8.5", mdl["p_under"], tot < 8.5)
 
     if not rows:
         return None, "No game results could be reconstructed."
