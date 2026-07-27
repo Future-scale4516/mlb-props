@@ -412,6 +412,9 @@ def _conditions_str(park):
     if venue:
         bits.append(venue)
     return " · ".join(bits) if bits else ""
+
+
+def _safe_int(v):
     """int() that returns None instead of raising for NaN, None or junk.
 
     Needed because a TBD probable pitcher comes back from pandas as NaN — and
