@@ -37,27 +37,25 @@ MIN_PA_FOR_RECENT_FORM = 20  # below this, the recent window is too thin to use
 # the earlier hand-set ones, kept so behaviour doesn't change until refitted.
 # shrink=0 means "no correction, this market is already well calibrated".
 CALIBRATION_FITS = {
-    # Fitted using fit_calibration()'s own method (weighted decile-bucket
-    # regression, shrink capped at 0.60) on 2 slates: 2026-07-22 and 2026-07-26,
-    # ~2,570 graded Most-Likely picks. adjusted = raw*(1-shrink) + base*shrink.
+    # Re-fit from a proper 30-day backtest (~4,940 graded predictions PER
+    # MARKET via the Backtest page) — a much larger, more trustworthy sample
+    # than the 2-slate numbers (~2,570 total picks) these replace. Every market
+    # showed the same shape: close to honest in the 10-40% confidence range,
+    # then increasingly overconfident above that — and in every chart, the
+    # last 2-3 confidence buckets had single-digit sample sizes (as low as
+    # N=1) and should be ignored as noise, not treated as a trend.
     #
-    # IMPORTANT: an earlier version of these numbers was fit by hand-solving
-    # for "shrink that makes the mean match", which bypasses fit_calibration's
-    # 0.60 safety cap and crushes variance along with bias — it made RBI (and
-    # to a lesser extent Runs/Total Bases) barely respond to the raw model %
-    # at all, which is why recommendations nearly disappeared. These values
-    # are back on the proper method. Always regenerate via "Fit calibration
-    # from backtest" on the Backtest page rather than solving by hand — two
-    # slates is enough to see direction, not to lock these in for good.
-    "Runs":        {"base": 0.28, "shrink": 0.42},  # slope 0.58 — real overconfidence, moderate correction
-    "RBI":         {"base": 0.19, "shrink": 0.52},  # slope 0.48 — the least reliable market bar HR; corrected but not flattened
-    "Total Bases": {"base": 0.24, "shrink": 0.56},  # ALSO gets a distribution fix (see p_total_bases_over)
-    # Hits: fitted slope was 1.07 (i.e. raw_shrink went slightly negative,
-    # capped at 0) — it was already well-calibrated, so no shrink is applied.
-    # Home Run: only 94 picks across 2 nights produced just 1 usable decile
-    # bucket — not enough to fit reliably (fit_calibration itself would refuse,
-    # needing 3+ bands). Left uncorrected until more nights accumulate; treat
-    # every HR pick as lower-confidence than its % suggests in the meantime.
+    # adjusted = raw*(1-shrink) + base*shrink. Regenerate periodically via
+    # "Fit calibration from backtest" — 30 days is far better than 2 nights,
+    # but the league changes over a season, so this should still be refreshed
+    # every so often rather than treated as permanent.
+    "Runs":        {"base": 0.18, "shrink": 0.20},  # was base 0.28/shrink 0.42 — real signal, lighter correction than first thought
+    "RBI":         {"base": 0.12, "shrink": 0.39},  # was base 0.19/shrink 0.52 — confirmed weakest market: worse than a flat guess on both Brier and accuracy before this fit
+    "Total Bases": {"base": 0.22, "shrink": 0.60},  # was base 0.24/shrink 0.56 — this backtest measured the model AFTER the existing distribution fix + shrink, and found genuine residual overconfidence on top of it. The two stages combine mathematically to shrink=0.637, but that exceeds the app's own 0.60 safety cap (the same cap that got bypassed and broke RBI earlier this session) — held at 0.60 rather than repeat that mistake. ALSO gets the distribution fix (see p_total_bases_over).
+    "Home Run":    {"base": 0.07, "shrink": 0.22},  # first real fit — was left uncorrected (only 94 picks, 1 usable bucket); this backtest had ~4,940, enough for a genuine (light) fit
+    # Hits: the 30-day backtest confirmed the original finding — beats a flat
+    # guess on both Brier score and accuracy, gaps are small (2-7pts) and
+    # shrink as confidence rises rather than growing. No shrink applied.
 }
 
 BALLPARKS = {
