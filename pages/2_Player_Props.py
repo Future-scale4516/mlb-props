@@ -155,6 +155,17 @@ if isinstance(st.session_state.get("most_likely_df"), pd.DataFrame):
     if ml_note:
         st.caption(ml_note)
 
+    show_form_ml = st.checkbox(
+        f"Show last-{FORM_GAMES} games form (slower — one lookup per player)",
+        key="ml_form_toggle")
+    st.caption(f"Checks whether each player actually cleared this market's line "
+               f"(1+ for HR/Hits/RBI/Runs, 2+ for Total Bases) in each of their "
+               f"last {FORM_GAMES} games. Not available for the Runs+Hits+RBI "
+               "combo tab — it isn't a single box-score stat, so there's no one "
+               "line to check form against. Free MLB data, but it's one call "
+               "per player — the first check each session takes a few seconds; "
+               "results are cached for 3 hours after that.")
+
     def show_ml(tab, label, is_tb=False):
         with tab:
             sub = ml_df[ml_df["Market"] == label].copy()
@@ -168,9 +179,21 @@ if isinstance(st.session_state.get("most_likely_df"), pd.DataFrame):
             ], key=f"sort_ml_{label}")
             for _, row in sub.head(40).iterrows():
                 value_str = f"{row['Value']:.2f}" if is_tb else f"{row['Value']:.1f}%"
+                metrics = [(value_label, value_str)]
+                if show_form_ml and row.get("PlayerID") and row.get("MarketKey"):
+                    try:
+                        point = 1.5 if is_tb else 0.5
+                        hits, played, syms = form_streak(
+                            int(row["PlayerID"]), sel_date.year, row["MarketKey"], point)
+                        if hits is not None and played:
+                            metrics.append(("Form", f"{hits}/{played}"))
+                    except Exception:
+                        # One player's form lookup failing must not take the
+                        # rest of the list down with it.
+                        pass
                 render_pick_card(
                     None, row["Player"], f"{row['Game']} · Slot #{int(row['Order'])}",
-                    [(value_label, value_str)], conditions=row.get("Conditions"))
+                    metrics, conditions=row.get("Conditions"))
 
     ml_hr, ml_hit, ml_rbi, ml_run, ml_combo, ml_tb = st.tabs(
         ["💥 Home Run", "🎯 Hits", "📥 RBI", "🏃 Runs", "🎰 Runs+Hits+RBI", "📦 Total Bases"])
