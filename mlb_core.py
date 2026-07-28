@@ -2231,22 +2231,29 @@ def build_most_likely(sel_date, max_games=15):
                         p = _calibration_adjust(p, lbl)
                     probs[mkey] = p
                     rows.append([lbl, player_name, gl, start,
-                                 int(order), round(p * 100, 1), _conditions_str(park)])
+                                 int(order), round(p * 100, 1), _conditions_str(park),
+                                 _bpid, mkey])
                 # combo: P(at least one of hits/runs/RBI >= 1)
                 cp = _combo_prob(probs)
                 if cp is not None:
+                    # No single box-score stat backs "1+ of three markets", so
+                    # there's no market_key form_streak can check here — leave
+                    # it blank; the UI skips the form lookup when MarketKey is empty.
                     rows.append(["Runs+Hits+RBI (1+)", player_name, gl, start,
-                                 int(order), round(cp * 100, 1), _conditions_str(park)])
+                                 int(order), round(cp * 100, 1), _conditions_str(park),
+                                 _bpid, None])
                 # Total Bases: expected value, not a "1+" probability (any hit is
                 # already >=1 TB, so a threshold framing would just duplicate Hits)
                 rows.append(["Total Bases (expected)", player_name, gl, start,
-                             int(order), round(lam["batter_total_bases"], 2), _conditions_str(park)])
+                             int(order), round(lam["batter_total_bases"], 2), _conditions_str(park),
+                             _bpid, "batter_total_bases"])
         if not had:
             no_lineups += 1
         n += 1
     if not rows:
         return None, "No confirmed lineups posted yet for these games (try closer to first pitch)."
-    df = pd.DataFrame(rows, columns=["Market", "Player", "Game", "Start", "Order", "Value", "Conditions"])
+    df = pd.DataFrame(rows, columns=["Market", "Player", "Game", "Start", "Order", "Value",
+                                     "Conditions", "PlayerID", "MarketKey"])
     note = f"Ranked batters across {n - no_lineups} game(s) with confirmed lineups."
     if no_lineups:
         note += f" {no_lineups} game(s) had no lineup posted yet."
