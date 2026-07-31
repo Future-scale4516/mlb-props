@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 import time
 import math, statistics
 import os
+import gc
 
 try:
     import joblib
@@ -446,7 +447,7 @@ def _safe_int(v):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_handedness_splits(season: int, as_of_date=None, days_back: int = 120):
+def fetch_handedness_splits(season: int, as_of_date=None, days_back: int = 30):
     """Real per-player handedness splits from Statcast pitch-level data — NOT
     from Baseball-Reference's per-player splits pages (pybaseball.get_splits).
 
@@ -471,11 +472,20 @@ def fetch_handedness_splits(season: int, as_of_date=None, days_back: int = 120):
     correctness costs more here, deliberately.
 
     `days_back` bounds the pull to keep it a reasonable size/speed rather than
-    fetching the full season on every cache miss — wider windows give more
-    stable rates (platoon splits are a genuinely noisy stat: even a full
-    season is often too small a sample, especially for a batter's less-common
-    side) at the cost of a slower, heavier fetch. 120 days is a starting
-    tradeoff, not a tuned number.
+    fetching the full season on every cache miss. A 120-day, whole-league pull
+    is roughly 500k+ pitch rows across ~90 raw Statcast columns — north of
+    500MB before pybaseball's own internal per-day concatenation overhead or
+    any of this function's own processing on top of it. On a resource-capped
+    free-tier deploy that's a real risk of the process being killed by the
+    PLATFORM for using too much memory — which shows up as a silent crash with
+    NO Python traceback (the process is gone before it can log one), not as
+    an exception this function could ever catch. That's the actual failure
+    this app hit once already. 30 days is a much safer default; it's a real
+    tradeoff (platoon splits are a genuinely noisy stat — even a full season
+    is often too small a sample on a batter's less-common side, so a shorter
+    window makes that worse), not a free improvement. Widen it deliberately,
+    not by accident, and only once the app's memory budget is known to have
+    headroom for it.
 
     Returns (batter_splits, pitcher_splits) — each a DataFrame with a `pa`
     (plate appearances) column alongside the rates, so a caller can apply
@@ -516,80 +526,111 @@ def fetch_handedness_splits(season: int, as_of_date=None, days_back: int = 120):
         st.session_state["handedness_error"] = "statcast() returned no rows for this window."
         return empty
 
-    # One row per PITCH; keep only the last pitch of each plate appearance
-    # (where `events` is set) so each row below is exactly one PA outcome.
-    pa = raw[raw["events"].notna()].copy()
+    # Statcast's raw pull carries ~90 columns per pitch (exit velocity, spin
+    # rate, pitch coordinates, etc.) — we need 7. Slicing down immediately,
+    # before any further processing, means the ~90-column version only exists
+    # for as long as it takes to run this one line, rather than sitting in
+    # memory for the rest of the function alongside everything derived from
+    # it. `del` + a manual GC pass actually matters here (not usually
+    # something worth doing in Python) because the object being dropped is
+    # genuinely large enough for it to matter on a memory-capped deploy.
+    NEEDED_COLS = ["batter", "pitcher", "p_throws", "stand", "events",
+                  "woba_value", "woba_denom"]
+    have_cols = [c for c in NEEDED_COLS if c in raw.columns]
+    pa = raw.loc[raw["events"].notna(), have_cols].copy()
+    del raw
+    gc.collect()
+
     if pa.empty:
         st.session_state["handedness_error"] = "No completed plate appearances in this window."
         return empty
 
-    HIT_BASES = {"single": 1, "double": 2, "triple": 3, "home_run": 4}
-    AB_EXCLUDE = {"walk", "hit_by_pitch", "sac_fly", "sac_bunt",
-                 "catcher_interf", "sac_fly_double_play"}
-    K_EVENTS = {"strikeout", "strikeout_double_play"}
-    BB_EVENTS = {"walk", "hit_by_pitch"}
-
-    pa["bases"] = pa["events"].map(HIT_BASES).fillna(0)
-    pa["is_ab"] = ~pa["events"].isin(AB_EXCLUDE)
-    pa["is_hit"] = pa["events"].isin(HIT_BASES)
-    pa["is_k"] = pa["events"].isin(K_EVENTS)
-    pa["is_bb"] = pa["events"].isin(BB_EVENTS)
-    # woba_value/woba_denom are Statcast's own per-PA wOBA components — using
-    # these directly is standard practice and avoids re-deriving wOBA's linear
-    # weights by hand.
-    have_woba = "woba_value" in pa.columns and "woba_denom" in pa.columns
-
-    def agg_batter(g):
-        ab = g["is_ab"].sum()
-        iso = (g["bases"].sum() - g["is_hit"].sum()) / ab if ab > 0 else None
-        woba = (g["woba_value"].sum() / g["woba_denom"].sum()
-                if have_woba and g["woba_denom"].sum() > 0 else None)
-        return pd.Series({"pa": len(g), "wOBA": woba, "ISO": iso})
-
-    def agg_pitcher(g):
-        n = len(g)
-        return pd.Series({"pa": n, "k_pct": g["is_k"].sum() / n if n else None,
-                          "bb_pct": g["is_bb"].sum() / n if n else None})
-
     try:
-        bat_by_hand = (pa.groupby(["batter", "p_throws"])
-                      .apply(agg_batter, include_groups=False).reset_index())
-        pit_by_hand = (pa.groupby(["pitcher", "stand"])
-                      .apply(agg_pitcher, include_groups=False).reset_index())
-    except TypeError:
-        # older pandas without include_groups=
-        bat_by_hand = pa.groupby(["batter", "p_throws"]).apply(agg_batter).reset_index()
-        pit_by_hand = pa.groupby(["pitcher", "stand"]).apply(agg_pitcher).reset_index()
+        # statcast() internally calls .convert_dtypes(), which returns pandas'
+        # NULLABLE extension dtypes (Int64/Float64/boolean) rather than plain
+        # numpy ones. Casting back to numpy here removes an entire class of
+        # dtype-interaction risk in the arithmetic below, regardless of the
+        # exact mechanism — cheap insurance against something that's already
+        # crashed this app once.
+        for col in ("batter", "pitcher"):
+            pa[col] = pa[col].astype("int64")
+        for col in ("woba_value", "woba_denom"):
+            if col in pa.columns:
+                pa[col] = pd.to_numeric(pa[col], errors="coerce").astype("float64")
 
-    def pivot_hand(df, id_col, hand_col, value_cols, rename_map):
-        out = None
-        for hand, suffix in [("L", "_vs_L"), ("R", "_vs_R")]:
-            sub = df[df[hand_col] == hand][[id_col] + value_cols].copy()
-            sub = sub.rename(columns={c: rename_map[c] + suffix for c in value_cols})
-            sub = sub.rename(columns={id_col: "player_id"})
-            out = sub if out is None else pd.merge(out, sub, on="player_id", how="outer")
-        return out
+        HIT_BASES = {"single": 1, "double": 2, "triple": 3, "home_run": 4}
+        AB_EXCLUDE = {"walk", "hit_by_pitch", "sac_fly", "sac_bunt",
+                     "catcher_interf", "sac_fly_double_play"}
+        K_EVENTS = {"strikeout", "strikeout_double_play"}
+        BB_EVENTS = {"walk", "hit_by_pitch"}
 
-    batter_splits = pivot_hand(bat_by_hand, "batter", "p_throws",
-                               ["pa", "wOBA", "ISO"],
-                               {"pa": "pa", "wOBA": "wOBA", "ISO": "ISO"})
-    pitcher_splits = pivot_hand(pit_by_hand, "pitcher", "stand",
-                                ["pa", "k_pct", "bb_pct"],
-                                {"pa": "pa", "k_pct": "k_pct", "bb_pct": "bb_pct"})
-    if batter_splits is None:
-        batter_splits = empty[0]
-    if pitcher_splits is None:
-        pitcher_splits = empty[1]
-    # Index by player_id for fast .loc lookups downstream (this gets looked up
-    # once per player per market — a boolean-mask scan each time would add up
-    # over a full slate). drop_duplicates is a safety net; the groupby+pivot
-    # above shouldn't produce dupes, but a duplicate index would silently turn
-    # .loc[id] into a DataFrame instead of a Series and break the callers.
-    if not batter_splits.empty:
-        batter_splits = batter_splits.drop_duplicates(subset=["player_id"]).set_index("player_id")
-    if not pitcher_splits.empty:
-        pitcher_splits = pitcher_splits.drop_duplicates(subset=["player_id"]).set_index("player_id")
-    return batter_splits, pitcher_splits
+        pa["bases"] = pa["events"].map(HIT_BASES).fillna(0).astype("float64")
+        pa["is_ab"] = (~pa["events"].isin(AB_EXCLUDE)).astype("float64")
+        pa["is_hit"] = pa["events"].isin(HIT_BASES).astype("float64")
+        pa["is_k"] = pa["events"].isin(K_EVENTS).astype("float64")
+        pa["is_bb"] = pa["events"].isin(BB_EVENTS).astype("float64")
+        have_woba = "woba_value" in pa.columns and "woba_denom" in pa.columns
+
+        # Fully vectorized aggregation (named aggregation via .agg(), no
+        # .apply() with a custom per-group Python function) — faster on a
+        # 100k+ row pull, and sidesteps groupby().apply()'s include_groups
+        # deprecation churn across pandas versions entirely, since it's never
+        # called.
+        bat_agg = {"pa": ("events", "size"), "ab": ("is_ab", "sum"),
+                  "bases": ("bases", "sum"), "hits": ("is_hit", "sum")}
+        if have_woba:
+            bat_agg["woba_val_sum"] = ("woba_value", "sum")
+            bat_agg["woba_denom_sum"] = ("woba_denom", "sum")
+        bat_by_hand = pa.groupby(["batter", "p_throws"], as_index=False).agg(**bat_agg)
+        bat_by_hand["ISO"] = ((bat_by_hand["bases"] - bat_by_hand["hits"])
+                              / bat_by_hand["ab"].replace(0, pd.NA))
+        bat_by_hand["wOBA"] = (bat_by_hand["woba_val_sum"] / bat_by_hand["woba_denom_sum"].replace(0, pd.NA)
+                               if have_woba else pd.NA)
+
+        pit_by_hand = pa.groupby(["pitcher", "stand"], as_index=False).agg(
+            pa=("events", "size"), k_sum=("is_k", "sum"), bb_sum=("is_bb", "sum"))
+        pit_by_hand["k_pct"] = pit_by_hand["k_sum"] / pit_by_hand["pa"]
+        pit_by_hand["bb_pct"] = pit_by_hand["bb_sum"] / pit_by_hand["pa"]
+
+        def pivot_hand(df, id_col, hand_col, value_cols, rename_map):
+            out = None
+            for hand, suffix in [("L", "_vs_L"), ("R", "_vs_R")]:
+                sub = df[df[hand_col] == hand][[id_col] + value_cols].copy()
+                sub = sub.rename(columns={c: rename_map[c] + suffix for c in value_cols})
+                sub = sub.rename(columns={id_col: "player_id"})
+                out = sub if out is None else pd.merge(out, sub, on="player_id", how="outer")
+            return out
+
+        batter_splits = pivot_hand(bat_by_hand, "batter", "p_throws",
+                                   ["pa", "wOBA", "ISO"],
+                                   {"pa": "pa", "wOBA": "wOBA", "ISO": "ISO"})
+        pitcher_splits = pivot_hand(pit_by_hand, "pitcher", "stand",
+                                    ["pa", "k_pct", "bb_pct"],
+                                    {"pa": "pa", "k_pct": "k_pct", "bb_pct": "bb_pct"})
+        if batter_splits is None:
+            batter_splits = empty[0]
+        if pitcher_splits is None:
+            pitcher_splits = empty[1]
+        # Index by player_id for fast .loc lookups downstream (this gets looked
+        # up once per player per market — a boolean-mask scan each time would
+        # add up over a full slate). drop_duplicates is a safety net; the
+        # groupby+pivot above shouldn't produce dupes, but a duplicate index
+        # would silently turn .loc[id] into a DataFrame instead of a Series
+        # and break the callers.
+        if not batter_splits.empty:
+            batter_splits = batter_splits.drop_duplicates(subset=["player_id"]).set_index("player_id")
+        if not pitcher_splits.empty:
+            pitcher_splits = pitcher_splits.drop_duplicates(subset=["player_id"]).set_index("player_id")
+        return batter_splits, pitcher_splits
+    except Exception as e:
+        # Whatever the exact cause — a dtype surprise, a schema change on
+        # Baseball Savant's side, anything unforeseen — this function must
+        # degrade to "no split data available" rather than take the whole
+        # page down with it, same as every other fetch in this file. The
+        # message is recorded so the actual cause can be found via
+        # st.session_state["handedness_error"] rather than a bare crash.
+        st.session_state["handedness_error"] = f"Split aggregation failed: {type(e).__name__}: {e}"
+        return empty
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
