@@ -21,13 +21,23 @@ except Exception:
     _UTC = None
 
 # --- Platoon (handedness) ---------------------------------------------------
-# League-average platoon effect, NOT per-batter splits. Individual batter splits
-# exist but need a separate call per player and are thin-sample noisy for most
-# hitters, so this applies the well-established league-wide effect instead:
-# batters do better against opposite-handed pitching. Switch hitters ("S") get
-# no adjustment since they bat from whichever side is favourable anyway.
+# These are used as the SHRINKAGE TARGET (the "prior") for real per-player
+# splits from fetch_handedness_splits — not just a flat fallback anymore.
+# Switch hitters ("S") get no adjustment since they bat from whichever side
+# is favourable anyway.
 PLATOON_ADVANTAGE = 1.06     # opposite-handed matchup (e.g. LHB vs RHP)
 PLATOON_DISADVANTAGE = 0.94  # same-handed matchup (e.g. RHB vs RHP)
+
+# Sample sizes (in PA) at which a player's own observed split gets equal
+# weight to the prior above. Batter platoon skill is a well-documented SLOW
+# stabilizer — commonly cited stabilization points for a batter's own platoon
+# split run well over 500 PA, often cited close to 1000+, since it's a small
+# true effect sitting on top of a lot of single-game noise. Pitcher handedness
+# splits (K%/BB% vs batter side) stabilize meaningfully faster. Both numbers
+# are approximations, same category as the other league constants in this
+# file — worth revisiting once there's a real backtest to fit them against.
+PLATOON_STABILIZATION_PA = 1000
+PITCHER_SPLIT_STABILIZATION_PA = 300
 
 # --- Recent form ------------------------------------------------------------
 RECENT_FORM_DAYS = 30        # window for "recent form" stats
@@ -435,13 +445,314 @@ def _safe_int(v):
         return None
 
 
-def platoon_factor(bat_side, pitch_hand):
-    """League-average platoon multiplier for a batter/pitcher handedness matchup.
-    Returns 1.0 (neutral) when either side is unknown or the batter is a switch
-    hitter — never guesses when the data isn't there."""
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_handedness_splits(season: int, as_of_date=None, days_back: int = 120):
+    """Real per-player handedness splits from Statcast pitch-level data — NOT
+    from Baseball-Reference's per-player splits pages (pybaseball.get_splits).
+
+    That distinction matters and is deliberate: get_splits scrapes ONE
+    player's Bref page per call, rate-limited by pybaseball itself to 10
+    requests/minute (see pybaseball.split_stats.BRefSession) — looping it over
+    500+ batters would take most of an hour and risks the exact "scraper
+    blocked on Streamlit Cloud" problem this codebase already hit once with
+    Fangraphs (see fetch_savant_stats). Statcast's bulk pitch-level puller
+    (pybaseball.statcast) returns every pitch for every player in ONE call,
+    same reliable source as fetch_savant_stats already uses — so it's the only
+    practical way to get real splits for a whole slate at once.
+
+    `as_of_date` is the window's END date — defaults to today for live picks,
+    but callers reconstructing a PAST slate (build_priced_results,
+    build_prop_results) MUST pass the date being reconstructed. Without this,
+    "splits as of today" would leak into a reconstruction of last month's
+    picks — using data that didn't exist yet at the time, which would make a
+    backtest look better than the live model could ever actually be. Each
+    distinct as_of_date is its own cache entry, so backtesting many different
+    dates means many separate Statcast pulls rather than reusing one —
+    correctness costs more here, deliberately.
+
+    `days_back` bounds the pull to keep it a reasonable size/speed rather than
+    fetching the full season on every cache miss — wider windows give more
+    stable rates (platoon splits are a genuinely noisy stat: even a full
+    season is often too small a sample, especially for a batter's less-common
+    side) at the cost of a slower, heavier fetch. 120 days is a starting
+    tradeoff, not a tuned number.
+
+    Returns (batter_splits, pitcher_splits) — each a DataFrame with a `pa`
+    (plate appearances) column alongside the rates, so a caller can apply
+    sample-size-aware shrinkage rather than trusting a 12-PA split at face
+    value. Returns two EMPTY DataFrames (never None, never raises) if the
+    pull fails, so a bad fetch degrades to "no split data available" rather
+    than crashing the page.
+    """
+    st.session_state["handedness_error"] = ""
+    empty = (pd.DataFrame(columns=["player_id", "wOBA_vs_L", "wOBA_vs_R",
+                                   "ISO_vs_L", "ISO_vs_R", "pa_vs_L", "pa_vs_R"]),
+             pd.DataFrame(columns=["player_id", "k_pct_vs_L", "k_pct_vs_R",
+                                   "bb_pct_vs_L", "bb_pct_vs_R", "pa_vs_L", "pa_vs_R"]))
+    try:
+        from pybaseball import statcast
+    except Exception as e:
+        st.session_state["handedness_error"] = f"pybaseball import failed: {e}"
+        return empty
+
+    end_d = as_of_date if as_of_date is not None else date.today()
+    if isinstance(end_d, datetime):
+        end_d = end_d.date()
+    start_d = end_d - timedelta(days=days_back)
+    # Don't reach back before the season started
+    season_start = date(season, 3, 15)
+    if start_d < season_start:
+        start_d = season_start
+    if start_d >= end_d:
+        return empty
+
+    try:
+        raw = statcast(start_dt=start_d.strftime("%Y-%m-%d"),
+                       end_dt=end_d.strftime("%Y-%m-%d"), verbose=False)
+    except Exception as e:
+        st.session_state["handedness_error"] = f"statcast() pull failed: {e}"
+        return empty
+    if raw is None or raw.empty:
+        st.session_state["handedness_error"] = "statcast() returned no rows for this window."
+        return empty
+
+    # One row per PITCH; keep only the last pitch of each plate appearance
+    # (where `events` is set) so each row below is exactly one PA outcome.
+    pa = raw[raw["events"].notna()].copy()
+    if pa.empty:
+        st.session_state["handedness_error"] = "No completed plate appearances in this window."
+        return empty
+
+    HIT_BASES = {"single": 1, "double": 2, "triple": 3, "home_run": 4}
+    AB_EXCLUDE = {"walk", "hit_by_pitch", "sac_fly", "sac_bunt",
+                 "catcher_interf", "sac_fly_double_play"}
+    K_EVENTS = {"strikeout", "strikeout_double_play"}
+    BB_EVENTS = {"walk", "hit_by_pitch"}
+
+    pa["bases"] = pa["events"].map(HIT_BASES).fillna(0)
+    pa["is_ab"] = ~pa["events"].isin(AB_EXCLUDE)
+    pa["is_hit"] = pa["events"].isin(HIT_BASES)
+    pa["is_k"] = pa["events"].isin(K_EVENTS)
+    pa["is_bb"] = pa["events"].isin(BB_EVENTS)
+    # woba_value/woba_denom are Statcast's own per-PA wOBA components — using
+    # these directly is standard practice and avoids re-deriving wOBA's linear
+    # weights by hand.
+    have_woba = "woba_value" in pa.columns and "woba_denom" in pa.columns
+
+    def agg_batter(g):
+        ab = g["is_ab"].sum()
+        iso = (g["bases"].sum() - g["is_hit"].sum()) / ab if ab > 0 else None
+        woba = (g["woba_value"].sum() / g["woba_denom"].sum()
+                if have_woba and g["woba_denom"].sum() > 0 else None)
+        return pd.Series({"pa": len(g), "wOBA": woba, "ISO": iso})
+
+    def agg_pitcher(g):
+        n = len(g)
+        return pd.Series({"pa": n, "k_pct": g["is_k"].sum() / n if n else None,
+                          "bb_pct": g["is_bb"].sum() / n if n else None})
+
+    try:
+        bat_by_hand = (pa.groupby(["batter", "p_throws"])
+                      .apply(agg_batter, include_groups=False).reset_index())
+        pit_by_hand = (pa.groupby(["pitcher", "stand"])
+                      .apply(agg_pitcher, include_groups=False).reset_index())
+    except TypeError:
+        # older pandas without include_groups=
+        bat_by_hand = pa.groupby(["batter", "p_throws"]).apply(agg_batter).reset_index()
+        pit_by_hand = pa.groupby(["pitcher", "stand"]).apply(agg_pitcher).reset_index()
+
+    def pivot_hand(df, id_col, hand_col, value_cols, rename_map):
+        out = None
+        for hand, suffix in [("L", "_vs_L"), ("R", "_vs_R")]:
+            sub = df[df[hand_col] == hand][[id_col] + value_cols].copy()
+            sub = sub.rename(columns={c: rename_map[c] + suffix for c in value_cols})
+            sub = sub.rename(columns={id_col: "player_id"})
+            out = sub if out is None else pd.merge(out, sub, on="player_id", how="outer")
+        return out
+
+    batter_splits = pivot_hand(bat_by_hand, "batter", "p_throws",
+                               ["pa", "wOBA", "ISO"],
+                               {"pa": "pa", "wOBA": "wOBA", "ISO": "ISO"})
+    pitcher_splits = pivot_hand(pit_by_hand, "pitcher", "stand",
+                                ["pa", "k_pct", "bb_pct"],
+                                {"pa": "pa", "k_pct": "k_pct", "bb_pct": "bb_pct"})
+    if batter_splits is None:
+        batter_splits = empty[0]
+    if pitcher_splits is None:
+        pitcher_splits = empty[1]
+    # Index by player_id for fast .loc lookups downstream (this gets looked up
+    # once per player per market — a boolean-mask scan each time would add up
+    # over a full slate). drop_duplicates is a safety net; the groupby+pivot
+    # above shouldn't produce dupes, but a duplicate index would silently turn
+    # .loc[id] into a DataFrame instead of a Series and break the callers.
+    if not batter_splits.empty:
+        batter_splits = batter_splits.drop_duplicates(subset=["player_id"]).set_index("player_id")
+    if not pitcher_splits.empty:
+        pitcher_splits = pitcher_splits.drop_duplicates(subset=["player_id"]).set_index("player_id")
+    return batter_splits, pitcher_splits
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_fangraphs_pitcher_advanced(season: int):
+    """xFIP and SIERA via Fangraphs' bulk season leaderboard (pybaseball's
+    pitching_stats — NOT a per-player scrape, one call for the whole league).
+
+    REAL RISK, same one already documented in fetch_savant_stats: this
+    codebase found Fangraphs scraping gets blocked from Streamlit Cloud's IPs,
+    which is exactly why batter advanced stats moved to Baseball Savant
+    instead. This may simply fail in production. It's wrapped the same
+    non-fatal way — returns an empty DataFrame and records the error rather
+    than raising, so a blocked call degrades to 'no xFIP/SIERA data', not a
+    broken page. If this turns out to be reliably blocked, the fallback is
+    computing an xFIP proxy from Statcast batted-ball data directly (xFIP's
+    formula is public and reproducible from flyball rate + K/BB/HBP/IP, all
+    available in the same statcast() pull used above) — SIERA's fitted
+    formula is more involved and would take more work to reproduce.
+    """
+    st.session_state["fangraphs_error"] = ""
+    try:
+        from pybaseball import pitching_stats
+        df = pitching_stats(season, season, qual=0)
+    except Exception as e:
+        st.session_state["fangraphs_error"] = f"Fangraphs pull failed (possibly blocked): {e}"
+        return pd.DataFrame(columns=["player_id", "xFIP", "SIERA", "K%", "BB%"])
+
+    def pick(cols, *cands):
+        for c in cands:
+            if c in cols:
+                return c
+        return None
+
+    id_c = pick(df.columns, "IDfg", "playerid", "player_id")
+    xfip_c = pick(df.columns, "xFIP")
+    siera_c = pick(df.columns, "SIERA")
+    k_c = pick(df.columns, "K%")
+    bb_c = pick(df.columns, "BB%")
+    keep = [c for c in [id_c, xfip_c, siera_c, k_c, bb_c] if c]
+    if not id_c or len(keep) < 2:
+        st.session_state["fangraphs_error"] = (
+            f"Expected columns not found. Got: {list(df.columns)[:20]}")
+        return pd.DataFrame(columns=["player_id", "xFIP", "SIERA", "K%", "BB%"])
+    out = df[keep].rename(columns={id_c: "player_id", xfip_c: "xFIP",
+                                   siera_c: "SIERA", k_c: "K%", bb_c: "BB%"})
+    # Fangraphs' K%/BB% come as fractions of 0-1 already in this endpoint in
+    # most pybaseball versions, but guard the same way fetch_savant_stats does
+    # in case a version serves whole percentages instead.
+    for c in ["K%", "BB%"]:
+        if c in out.columns and out[c].dropna().max() and out[c].dropna().max() > 1:
+            out[c] = out[c] / 100.0
+    return out
+
+
+def shrink_rate(observed, observed_n, baseline, stabilization_n):
+    """Regression-to-the-mean shrinkage: blend an observed rate toward a
+    baseline ("prior"), weighted by how much data backs the observation.
+
+        shrunk = (observed_n*observed + stabilization_n*baseline) / (observed_n + stabilization_n)
+
+    At observed_n=0 this returns baseline exactly (no data -> trust the
+    prior). As observed_n grows past stabilization_n, it converges toward the
+    observed value. This is the one shrinkage tool used for every real split
+    below (batter platoon wOBA, pitcher K%, pitcher BB%) rather than each
+    having its own bespoke blending logic.
+    """
+    if observed is None or observed_n is None or observed_n <= 0:
+        return baseline
+    return (observed_n * observed + stabilization_n * baseline) / (observed_n + stabilization_n)
+
+
+def _batter_hand_ratio(batter_id, hand, batter_splits):
+    """This batter's wOBA vs `hand`, relative to their OWN overall wOBA across
+    both hands in the fetched window (not vs a league average — comparing a
+    player to himself avoids needing a separate league-by-hand reference
+    table). Returns (ratio, pa_vs_hand); (None, 0) if unavailable.
+    ratio > 1.0 means this batter does better than his own average vs this
+    hand; < 1.0 means worse."""
+    if batter_splits is None or batter_splits.empty or not batter_id:
+        return None, 0
+    try:
+        row = batter_splits.loc[batter_id]
+    except KeyError:
+        return None, 0
+    pa_l, pa_r = row.get("pa_vs_L") or 0, row.get("pa_vs_R") or 0
+    woba_l, woba_r = row.get("wOBA_vs_L"), row.get("wOBA_vs_R")
+    if pa_l + pa_r <= 0 or woba_l is None or woba_r is None:
+        return None, 0
+    overall = (pa_l * woba_l + pa_r * woba_r) / (pa_l + pa_r)
+    if not overall:
+        return None, 0
+    target_pa = pa_l if hand == "L" else pa_r
+    target_woba = woba_l if hand == "L" else woba_r
+    if target_woba is None:
+        return None, 0
+    return target_woba / overall, target_pa
+
+
+def _pitcher_hand_ratio(pitcher_id, bat_side, pitcher_splits, metric):
+    """This pitcher's `metric` (k_pct or bb_pct) vs a batter of `bat_side`,
+    relative to the pitcher's OWN overall rate across both sides in the
+    fetched window. Returns (ratio, pa_vs_side); (None, 0) if unavailable."""
+    if pitcher_splits is None or pitcher_splits.empty or not pitcher_id:
+        return None, 0
+    try:
+        row = pitcher_splits.loc[pitcher_id]
+    except KeyError:
+        return None, 0
+    pa_l, pa_r = row.get("pa_vs_L") or 0, row.get("pa_vs_R") or 0
+    val_l, val_r = row.get(f"{metric}_vs_L"), row.get(f"{metric}_vs_R")
+    if pa_l + pa_r <= 0 or val_l is None or val_r is None:
+        return None, 0
+    overall = (pa_l * val_l + pa_r * val_r) / (pa_l + pa_r)
+    if not overall:
+        return None, 0
+    target_pa = pa_l if bat_side == "L" else pa_r
+    target_val = val_l if bat_side == "L" else val_r
+    if target_val is None:
+        return None, 0
+    return target_val / overall, target_pa
+
+
+def platoon_factor(bat_side, pitch_hand, batter_id=None, batter_splits=None):
+    """Platoon multiplier for a batter/pitcher handedness matchup. Returns 1.0
+    (neutral) when either side is unknown or the batter is a switch hitter —
+    never guesses when the data isn't there.
+
+    With no batter_id/batter_splits passed, behaves EXACTLY as before: the
+    flat league-average constant (PLATOON_ADVANTAGE/DISADVANTAGE). Existing
+    callers that don't pass the new optional args are unaffected.
+
+    With real split data available, blends this batter's own observed wOBA
+    split toward that same flat constant via shrink_rate — the constant acts
+    as the prior when a player has little or no data for this specific hand
+    (a rookie, a bench bat who rarely sees lefties), and the blend shifts
+    toward his own numbers as more of his own data backs them up.
+    """
     if not bat_side or not pitch_hand or bat_side == "S":
         return 1.0
-    return PLATOON_DISADVANTAGE if bat_side == pitch_hand else PLATOON_ADVANTAGE
+    flat = PLATOON_DISADVANTAGE if bat_side == pitch_hand else PLATOON_ADVANTAGE
+    if batter_id is None or batter_splits is None:
+        return flat
+    ratio, pa = _batter_hand_ratio(batter_id, pitch_hand, batter_splits)
+    return shrink_rate(ratio, pa, flat, PLATOON_STABILIZATION_PA)
+
+
+def personalize_pitcher_rate(pitcher_id, bat_side, base_value, pitcher_splits, metric):
+    """Shrink-adjust a pitcher's season-wide rate (opp_k9 or opp_whip) toward
+    their own split-specific tendency vs this batter's handedness.
+
+    `metric` is "k_pct" (adjusts opp_k9) or "bb_pct" (a rough proxy adjustment
+    for opp_whip — walks are only part of WHIP, so this is a directional nudge
+    from real split data, not a precise recomputation of the stat). Returns
+    base_value unchanged if no split data is available for this pitcher, so
+    every existing caller that doesn't pass pitcher_splits is unaffected.
+    """
+    if pitcher_splits is None or not pitcher_id or not bat_side or bat_side == "S":
+        return base_value
+    ratio, pa = _pitcher_hand_ratio(pitcher_id, bat_side, pitcher_splits, metric)
+    if ratio is None:
+        return base_value
+    shrunk_ratio = shrink_rate(ratio, pa, 1.0, PITCHER_SPLIT_STABILIZATION_PA)
+    return base_value * shrunk_ratio
 
 
 @st.cache_data(ttl=10800, show_spinner=False)
@@ -1998,6 +2309,7 @@ def build_prop_edges(sel_date, max_games=6, snapshot_by_event=None,
     """Full slate prop edges: per-game props adjusted for the opposing starter and
     ballpark. Returns (df, meta, note). Green+amber only (edge 2-15) is filtered in UI."""
     refresh_league_averages(sel_date.year)  # current league baselines, not stale constants
+    batter_splits, pitcher_splits = fetch_handedness_splits(sel_date.year, as_of_date=sel_date)
     sched = fetch_schedule(str(sel_date))
     if sched.empty:
         return None, {}, "No games scheduled for this date."
@@ -2112,8 +2424,13 @@ def build_prop_edges(sel_date, max_games=6, snapshot_by_event=None,
                     order, lineup_by_team.get(tid, {}), stat_by_id)
                 opp_pid = away_pid_p if tid == home_id else (home_pid_p if tid == away_id else None)
                 _opp_pid_i = _safe_int(opp_pid)
-                pf_platoon = platoon_factor(bats_map.get(pid),
-                                            throws_map.get(_opp_pid_i) if _opp_pid_i else None)
+                bat_side = bats_map.get(pid)
+                opp_hand = throws_map.get(_opp_pid_i) if _opp_pid_i else None
+                pf_platoon = platoon_factor(bat_side, opp_hand, pid, batter_splits)
+                opp_k9 = personalize_pitcher_rate(_opp_pid_i, bat_side, opp_k9,
+                                                  pitcher_splits, "k_pct")
+                opp_whip = personalize_pitcher_rate(_opp_pid_i, bat_side, opp_whip,
+                                                    pitcher_splits, "bb_pct")
                 srow_eff = blend_recent_form(srow, recent_map.get(pid))
                 lam = prop_expected_counts(srow_eff, expected_pa(order), opp_hr9, opp_k9, opp_whip,
                                            ahead_obp, behind_slg, park["hr"], park["run"],
@@ -2269,6 +2586,7 @@ def build_most_likely(sel_date, max_games=15):
     """Rank batters by the model's raw probability of recording >=1 of each prop
     market (no odds, no quota), using confirmed lineups, opposing starter and park."""
     refresh_league_averages(sel_date.year)  # current league baselines, not stale constants
+    batter_splits, pitcher_splits = fetch_handedness_splits(sel_date.year, as_of_date=sel_date)
     sched = fetch_schedule(str(sel_date))
     if sched.empty:
         return None, "No games scheduled for this date."
@@ -2324,9 +2642,14 @@ def build_most_likely(sel_date, max_games=15):
                 order = int(pr.get("order", 5) or 5)
                 _bpid = int(pr["player_id"])
                 ahead_obp, behind_slg = _lineup_context(order, slot_to_pid, stat_by_id)
-                pf_platoon = platoon_factor(bats_map.get(_bpid), opp_hand)
+                bat_side = bats_map.get(_bpid)
+                pf_platoon = platoon_factor(bat_side, opp_hand, _bpid, batter_splits)
+                opp_k9_eff = personalize_pitcher_rate(_opp_pid_ml_i, bat_side, opp_k9,
+                                                      pitcher_splits, "k_pct")
+                opp_whip_eff = personalize_pitcher_rate(_opp_pid_ml_i, bat_side, opp_whip,
+                                                        pitcher_splits, "bb_pct")
                 srow_eff = blend_recent_form(srow, recent_map.get(_bpid))
-                lam = prop_expected_counts(srow_eff, expected_pa(order), opp_hr9, opp_k9, opp_whip,
+                lam = prop_expected_counts(srow_eff, expected_pa(order), opp_hr9, opp_k9_eff, opp_whip_eff,
                                            ahead_obp, behind_slg, park["hr"], park["run"],
                                            platoon=pf_platoon)
                 probs = {}
@@ -2978,6 +3301,7 @@ def build_prop_results(sel_date, max_games=None):
     batter, using the real lineup and starter from that game, and checked
     against the real result. That's what this does: it answers "were the
     model's reads right?", not "what price was showing at the time?"."""
+    batter_splits, pitcher_splits = fetch_handedness_splits(sel_date.year, as_of_date=sel_date)
     results = fetch_day_results(str(sel_date))
     finals = [r for r in results if r.get("state") == "Final"]
     if not finals:
@@ -3047,8 +3371,13 @@ def build_prop_results(sel_date, max_games=None):
             ahead_obp, behind_slg = _lineup_context(
                 b["order"], slot_by_team.get(b["team_id"], {}), stat_by_id)
             _opp_pid_i = _safe_int(opp_pid)
-            pf_platoon = platoon_factor(bats_map.get(pid),
-                                        throws_map.get(_opp_pid_i) if _opp_pid_i else None)
+            bat_side = bats_map.get(pid)
+            opp_hand = throws_map.get(_opp_pid_i) if _opp_pid_i else None
+            pf_platoon = platoon_factor(bat_side, opp_hand, pid, batter_splits)
+            opp_k9 = personalize_pitcher_rate(_opp_pid_i, bat_side, opp_k9,
+                                              pitcher_splits, "k_pct")
+            opp_whip = personalize_pitcher_rate(_opp_pid_i, bat_side, opp_whip,
+                                                pitcher_splits, "bb_pct")
             lam = prop_expected_counts(srow, expected_pa(b["order"]), opp_hr9, opp_k9,
                                        opp_whip, ahead_obp, behind_slg,
                                        park["hr"], park["run"], platoon=pf_platoon)
