@@ -68,7 +68,7 @@ CALIBRATION_FITS = {
     # but the league changes over a season, so this should still be refreshed
     # every so often rather than treated as permanent.
     "Runs":        {"base": 0.18, "shrink": 0.20},  # was base 0.28/shrink 0.42 — real signal, lighter correction than first thought
-    "RBI":         {"base": 0.12, "shrink": 0.39},  # was base 0.19/shrink 0.52 — confirmed weakest market: worse than a flat guess on both Brier and accuracy before this fit
+    "RBI":         {"base": 0.12, "shrink": 0.44},  # RE-FIT for the Negative Binomial swap (see PROP_DISPERSION). The old 0.39 was fit against POISSON raw output; NB structurally lowers the raw probability, so the shrink had to be re-solved against the new raw values rather than left in place — leaving it would have stacked two corrections on top of each other, the exact trap hit earlier with Total Bases. Solved on ~900 graded picks: NB raw mean 38.6% -> shrink 0.44 -> 27.0% calibrated, against an actual 1+ rate of 27.0%.
     "Total Bases": {"base": 0.22, "shrink": 0.60},  # was base 0.24/shrink 0.56 — this backtest measured the model AFTER the existing distribution fix + shrink, and found genuine residual overconfidence on top of it. The two stages combine mathematically to shrink=0.637, but that exceeds the app's own 0.60 safety cap (the same cap that got bypassed and broke RBI earlier this session) — held at 0.60 rather than repeat that mistake. ALSO gets the distribution fix (see p_total_bases_over).
     "Home Run":    {"base": 0.07, "shrink": 0.22},  # first real fit — was left uncorrected (only 94 picks, 1 usable bucket); this backtest had ~4,940, enough for a genuine (light) fit
     # Hits: the 30-day backtest confirmed the original finding — beats a flat
@@ -726,7 +726,15 @@ def _batter_hand_ratio(batter_id, hand, batter_splits):
     target_woba = woba_l if hand == "L" else woba_r
     if target_woba is None:
         return None, 0
-    return target_woba / overall, target_pa
+    ratio = target_woba / overall
+    # Precautionary ceiling, not a fix for a confirmed issue — checked the
+    # math and the existing PLATOON_STABILIZATION_PA already makes realistic
+    # small-sample flukes contribute very little on their own (you'd need an
+    # implausible 200+ PA sample sustaining 2.5x a batter's own average to
+    # meaningfully move the shrunk result). Capping anyway costs nothing and
+    # protects against a genuinely pathological data point.
+    ratio = max(0.3, min(ratio, 3.0))
+    return ratio, target_pa
 
 
 def _pitcher_hand_ratio(pitcher_id, bat_side, pitcher_splits, metric):
@@ -750,7 +758,9 @@ def _pitcher_hand_ratio(pitcher_id, bat_side, pitcher_splits, metric):
     target_val = val_l if bat_side == "L" else val_r
     if target_val is None:
         return None, 0
-    return target_val / overall, target_pa
+    ratio = target_val / overall
+    ratio = max(0.3, min(ratio, 3.0))  # same precautionary ceiling as the batter side
+    return ratio, target_pa
 
 
 def platoon_factor(bat_side, pitch_hand, batter_id=None, batter_splits=None):
@@ -1794,10 +1804,17 @@ LG_HR9 = 1.15   # league avg HR allowed per 9 innings
 LG_K9 = 8.5     # league avg K per 9 innings
 LG_WHIP = 1.30  # league avg walks+hits per inning pitched
 LG_OBP_DEFAULT = 0.320  # league avg on-base %, used for "table setters ahead" context
-MIN_PA_FOR_RANKING = 30  # batters below this get excluded from prop rankings/edges —
+MIN_PA_FOR_RANKING = 80  # batters below this get excluded from prop rankings/edges —
                           # below this, season SLG/AVG/OBP are mostly noise from a
                           # handful of at-bats (e.g. a 2-game callup with one lucky
-                          # double looks like an elite slugger with zero real evidence)
+                          # double looks like an elite slugger with zero real evidence).
+                          # Raised from 30 after tracked results showed 30 was far too
+                          # permissive: two fringe players cleared it and were rated
+                          # 79% to homer and 100% for 2+ total bases (all four picks
+                          # lost). 80 PA is roughly three weeks of everyday play.
+                          # Paired with the plausibility ceilings in
+                          # prop_expected_counts, which backstop whatever still slips
+                          # through.
 LG_SLG_DEFAULT = 0.400  # league avg slugging, used for "run producers behind" context
 
 
@@ -1846,7 +1863,16 @@ def p_total_bases_over(exp_tb, point, ab=4.0):
         return None
     ab_int = max(1, int(round(ab)))
     h = exp_tb / (ab_int * LG_TB_PER_HIT)
-    h = min(max(h, 0.0), 0.95)  # per-AB probability of getting a hit at all
+    # Per-AB hit-probability cap. This was 0.95 and it was a real bug: with 4
+    # at-bats, h=0.95 means P(at least one hit) = 1-(0.05)^4 ≈ 99.9994% —
+    # rounds to a literal 100.0%, which is exactly what showed up in tracked
+    # results (two picks at Model %=100 that BOTH lost, one going 0-for-4).
+    # No real single-game matchup is that close to certain; even the best
+    # hitters against the worst pitchers don't approach a 95% chance of a hit
+    # in any one at-bat. 0.55 is still generous — a genuinely extreme
+    # favorable matchup — without letting the compounding blow up to
+    # near-certainty the way 0.95 did.
+    h = min(max(h, 0.0), 0.55)
 
     # Per-at-bat base-count distribution: P(0 bases)=1-h, then h split by hit type.
     per_ab = {0: 1.0 - h}
@@ -1864,7 +1890,15 @@ def p_total_bases_over(exp_tb, point, ab=4.0):
 
     need = int(math.floor(point)) + 1
     p_at_least = sum(p for tot, p in dist.items() if tot >= need)
-    return max(0.0, min(1.0, p_at_least))
+    p_at_least = max(0.0, min(1.0, p_at_least))
+    # Second line of defense, independent of the h-cap above: no single-game
+    # prop probability should ever be allowed to reach literal certainty. If
+    # something upstream (an extreme personalized platoon ratio, stacked
+    # matchup multipliers) still pushes this high despite the h-cap, capping
+    # here means the failure shows up as a suspiciously-high-but-plausible
+    # number instead of an impossible 100.0% — which is also exactly what
+    # MARKET_PROB_CEILING already does for Home Run for the same reason.
+    return min(p_at_least, 0.92)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -1893,15 +1927,68 @@ def refresh_league_averages(season):
     return avgs
 
 
+# Per-market dispersion (alpha) for count props. A market listed here is priced
+# with a Negative Binomial instead of a Poisson; anything absent stays Poisson.
+#
+# These are FITTED from tracked results, not assumed. For a Negative Binomial,
+# variance = mean + alpha*mean^2, so alpha = (var/mean - 1)/mean. Measured across
+# ~900 graded RBI picks and ~620 Runs picks:
+#
+#   RBI  — var/mean ran 1.32-1.58 and the derived alpha sat at 1.17/1.02/0.95/1.00
+#          across four independent lambda buckets. Consistently ~1.0, which is a
+#          clean NB fit. This matches the intuition: RBI depends heavily on
+#          teammates reaching base ahead of you, so outcomes clump far more than
+#          a Poisson allows.
+#
+#   Runs — DELIBERATELY ABSENT. Derived alpha came out at -0.26/-0.10/+0.18/+0.00
+#          across the same buckets, i.e. scattered around zero with overall
+#          var/mean = 1.00. That is textbook Poisson. Runs was originally going
+#          to be switched alongside RBI on the general argument that "runs depend
+#          on teammates too" — the data says otherwise, so it stays Poisson.
+#          Don't add it back without re-running that variance check.
+PROP_DISPERSION = {
+    "batter_rbis": 1.0,
+}
+
+
+def _p_over_line_nb(expected_count, point, alpha):
+    """P(count > point) via Negative Binomial with mean `expected_count` and
+    dispersion `alpha` (variance = mean + alpha*mean^2).
+
+    Used for count markets whose tracked results show real overdispersion.
+    Versus a Poisson of the same mean, this puts MORE probability on zero and
+    more on the high tail, and less in the middle — so for a 1+ line it
+    returns a lower, more honest probability, which is exactly the direction
+    RBI's backtests said it needed.
+    """
+    if point is None or expected_count is None:
+        return None
+    if expected_count <= 0:
+        return 0.0
+    if not alpha or alpha <= 0:
+        return _p_over_line(expected_count, point)
+    need = int(math.floor(point)) + 1
+    cum = sum(_nbinom_pmf(k, expected_count, alpha) for k in range(need))
+    return max(0.0, min(1.0, 1.0 - cum))
+
+
 def _prop_prob(market_key, lam_dict, point):
     """Single entry point for turning a batter's expected-count vector into a
-    P(over the line) for a given prop market. Total Bases uses the compound
-    per-at-bat model (bases arrive in clumps, capped by at-bats); every other
-    market is a genuine count and uses the Poisson. Callers should use this
-    rather than calling _p_over_line directly, so the TB special-case can never
-    be forgotten at one of the several call sites."""
+    P(over the line) for a given prop market. Three different tools, matched to
+    three different kinds of outcome:
+      - Total Bases: compound per-at-bat model (bases arrive in clumps of
+        1/2/3/4 from one swing, and are capped by ~4 at-bats)
+      - Markets in PROP_DISPERSION (currently RBI): Negative Binomial, because
+        their measured variance genuinely exceeds their mean
+      - Everything else (HR, Hits, Runs): Poisson, which their tracked results
+        support as the right shape
+    Callers should use this rather than calling _p_over_line directly, so none
+    of these special cases can be forgotten at one of the several call sites."""
     if market_key == "batter_total_bases":
         return p_total_bases_over(lam_dict["batter_total_bases"], point)
+    alpha = PROP_DISPERSION.get(market_key)
+    if alpha:
+        return _p_over_line_nb(lam_dict.get(market_key), point, alpha)
     return _p_over_line(lam_dict.get(market_key), point)
 
 
@@ -2163,6 +2250,32 @@ def prop_expected_counts(stat, pa, opp_hr9=LG_HR9, opp_k9=LG_K9, opp_whip=LG_WHI
     power_factor = 1.0 + 0.5 * min(max((opp_hr9 - LG_HR9) / LG_HR9, -0.3), 0.3)
     tb_park = 0.6 * park_hr + 0.4 * park_run
     tb_l = stat.get("slg", LG_SLG_DEFAULT) * ab_est * k_factor * power_factor * tb_park * platoon
+
+    # --- Physical plausibility ceilings -------------------------------------
+    # Every lambda above is a season RATE multiplied by a full game's expected
+    # plate appearances. If the underlying rate came from a tiny sample (a
+    # callup with 1 HR in 3 PA, or 2-for-2 with a double giving a 1.500+ SLG),
+    # the rate is meaningless but the multiplication still runs — producing
+    # the impossible outputs seen in tracked results: two fringe players
+    # (same two in BOTH markets) rated 79% to homer and 100% for 2+ total
+    # bases, all four of which lost. MIN_PA_FOR_RANKING=30 was supposed to
+    # prevent this and clearly wasn't a high enough floor.
+    #
+    # These ceilings are a backstop, not a substitute for good inputs — they
+    # convert an absurd number into merely a high one, so a bad input shows up
+    # as a suspicious pick rather than a fake lock. Values are set generously
+    # above any realistic matchup, so a genuine elite-hitter-vs-bad-pitcher
+    # spot is untouched:
+    #   HR   0.35/game (~29.5% to homer) — league avg is ~0.11 (~10%), an
+    #        elite slugger in a great park tops out near 0.25 (~22%)
+    #   Hits 2.2/game — a .400 hitter over 4-5 PA
+    #   RBI  1.8/game, Runs 1.6/game — both well above any sustained rate
+    #   TB   4.5/game — roughly a .900+ SLG across 4-5 AB
+    hr_l = min(hr_l, 0.35)
+    hit_l = min(hit_l, 2.2)
+    rbi_l = min(rbi_l, 1.8)
+    run_l = min(run_l, 1.6)
+    tb_l = min(tb_l, 4.5)
 
     return {"batter_home_runs": hr_l, "batter_hits": hit_l,
             "batter_rbis": rbi_l, "batter_runs_scored": run_l,
