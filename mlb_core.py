@@ -2257,21 +2257,30 @@ def prop_expected_counts(stat, pa, opp_hr9=LG_HR9, opp_k9=LG_K9, opp_whip=LG_WHI
     # callup with 1 HR in 3 PA, or 2-for-2 with a double giving a 1.500+ SLG),
     # the rate is meaningless but the multiplication still runs — producing
     # the impossible outputs seen in tracked results: two fringe players
-    # (same two in BOTH markets) rated 79% to homer and 100% for 2+ total
-    # bases, all four of which lost. MIN_PA_FOR_RANKING=30 was supposed to
-    # prevent this and clearly wasn't a high enough floor.
+    # rated 79% to homer and 100% for 2+ total bases, all four of which lost.
+    # MIN_PA_FOR_RANKING=30 was supposed to prevent this and clearly wasn't a
+    # high enough floor (since raised to 80).
     #
     # These ceilings are a backstop, not a substitute for good inputs — they
     # convert an absurd number into merely a high one, so a bad input shows up
-    # as a suspicious pick rather than a fake lock. Values are set generously
-    # above any realistic matchup, so a genuine elite-hitter-vs-bad-pitcher
-    # spot is untouched:
-    #   HR   0.35/game (~29.5% to homer) — league avg is ~0.11 (~10%), an
-    #        elite slugger in a great park tops out near 0.25 (~22%)
+    # as a suspicious pick rather than a fake lock.
+    #
+    # HR's ceiling was originally 0.35 and that was a mistake, found the next
+    # day in tracked results: 13 of 133 HR picks in one slate — spanning
+    # Yordan Alvarez, Matt Olson and Corey Seager down to a backup catcher —
+    # all flattened to the exact identical 24.6%, because 0.35 sits BELOW the
+    # base lambda a genuinely elite full-season slugger produces before any
+    # matchup adjustment at all (a 0.089 HR/PA year like peak Judge, times
+    # ~4.3 expected PA, is already 0.38). The cap was catching real stars, not
+    # just fluke tiny-sample rates — destroying exactly the differentiation
+    # the Most Likely page exists to show. Raised to 0.70 (raw P(1+)=50.3%,
+    # ~40.8% after calibration) — high enough that even an elite hitter in a
+    # great matchup has real room, while still well short of the 79%/100%
+    # territory that caused the original bug.
     #   Hits 2.2/game — a .400 hitter over 4-5 PA
     #   RBI  1.8/game, Runs 1.6/game — both well above any sustained rate
     #   TB   4.5/game — roughly a .900+ SLG across 4-5 AB
-    hr_l = min(hr_l, 0.35)
+    hr_l = min(hr_l, 0.70)
     hit_l = min(hit_l, 2.2)
     rbi_l = min(rbi_l, 1.8)
     run_l = min(run_l, 1.6)
