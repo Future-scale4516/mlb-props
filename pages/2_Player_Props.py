@@ -84,6 +84,13 @@ if isinstance(st.session_state.get("prop_edges"), pd.DataFrame):
                    "session takes a few seconds; results are cached for 3 hours "
                    "after that.")
 
+        game_options = sorted(prop_df["Game"].dropna().unique().tolist())
+        picked_games = st.multiselect(
+            "Filter by game", game_options, default=[], key="prop_game_filter",
+            help="Leave empty to show every game. Applies across all markets below.")
+        if picked_games:
+            prop_df = prop_df[prop_df["Game"].isin(picked_games)]
+
         def show_prop_market(tab, label):
             with tab:
                 sub = prop_df[prop_df["Market"] == label].copy()
@@ -165,6 +172,13 @@ if isinstance(st.session_state.get("most_likely_df"), pd.DataFrame):
                "line to check form against. Free MLB data, but it's one call "
                "per player — the first check each session takes a few seconds; "
                "results are cached for 3 hours after that.")
+
+    ml_game_options = sorted(ml_df["Game"].dropna().unique().tolist())
+    ml_picked_games = st.multiselect(
+        "Filter by game", ml_game_options, default=[], key="ml_game_filter",
+        help="Leave empty to show every game. Applies across all markets below.")
+    if ml_picked_games:
+        ml_df = ml_df[ml_df["Game"].isin(ml_picked_games)]
 
     def show_ml(tab, label, is_tb=False):
         with tab:
