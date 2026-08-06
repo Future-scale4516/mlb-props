@@ -1720,8 +1720,8 @@ def build_game_edges(sel_date, odds_override=None, meta_override=None):
         home_rpg = _park_neutral_rpg(team_off.get(hid, league_rpg), pf["run"])
         away_rpg = _park_neutral_rpg(team_off.get(aid, league_rpg),
                                      PARK_FACTORS.get(aid, NEUTRAL_PARK)["run"])
-        away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
-        home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
+        away_sp = fetch_pitcher_stats(gm.get("away_prob_id"), season=sel_date.year)
+        home_sp = fetch_pitcher_stats(gm.get("home_prob_id"), season=sel_date.year)
         away_bp = bullpen_era.get(aid, LEAGUE_BULLPEN_ERA_DEFAULT)
         home_bp = bullpen_era.get(hid, LEAGUE_BULLPEN_ERA_DEFAULT)
         _pitchers_known = (away_sp.get("name", "TBD") != "TBD"
@@ -2542,8 +2542,8 @@ def build_prop_edges(sel_date, max_games=6, snapshot_by_event=None,
         park = apply_weather_to_park(PARK_FACTORS.get(home_id, NEUTRAL_PARK),
                                       fetch_weather(gm.get("venue", "")))
         away_pid_p, home_pid_p = gm.get("away_prob_id"), gm.get("home_prob_id")
-        away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
-        home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
+        away_sp = fetch_pitcher_stats(gm.get("away_prob_id"), season=sel_date.year)
+        home_sp = fetch_pitcher_stats(gm.get("home_prob_id"), season=sel_date.year)
         order_map = {}
         lineup_by_team = {home_id: {}, away_id: {}}
         try:
@@ -2769,8 +2769,8 @@ def build_most_likely(sel_date, max_games=15):
         aid = int(gm.get("away_team_id") or 0)
         park = apply_weather_to_park(PARK_FACTORS.get(hid, NEUTRAL_PARK),
                                       fetch_weather(gm.get("venue", "")))
-        away_sp = fetch_pitcher_stats(gm.get("away_prob_id"))
-        home_sp = fetch_pitcher_stats(gm.get("home_prob_id"))
+        away_sp = fetch_pitcher_stats(gm.get("away_prob_id"), season=sel_date.year)
+        home_sp = fetch_pitcher_stats(gm.get("home_prob_id"), season=sel_date.year)
         try:
             lu = fetch_live_lineups(int(gm.get("gamePk")))
         except Exception:
@@ -2893,8 +2893,8 @@ def run_backtest(sel_date, days_back=14):
             home_rpg = _park_neutral_rpg(team_off.get(hid, league_rpg), park["run"])
             away_rpg = _park_neutral_rpg(team_off.get(aid, league_rpg),
                                          PARK_FACTORS.get(aid, NEUTRAL_PARK)["run"])
-            away_sp = fetch_pitcher_stats(r.get("away_prob_id")) if r.get("away_prob_id") else {"era": 4.5}
-            home_sp = fetch_pitcher_stats(r.get("home_prob_id")) if r.get("home_prob_id") else {"era": 4.5}
+            away_sp = fetch_pitcher_stats(r.get("away_prob_id"), season=sel_date.year) if r.get("away_prob_id") else {"era": 4.5}
+            home_sp = fetch_pitcher_stats(r.get("home_prob_id"), season=sel_date.year) if r.get("home_prob_id") else {"era": 4.5}
             away_bp = bullpen_era.get(aid, LEAGUE_BULLPEN_ERA_DEFAULT)
             home_bp = bullpen_era.get(hid, LEAGUE_BULLPEN_ERA_DEFAULT)
             mdl = model_game(home_rpg, away_rpg, away_sp.get("era", 4.5),
@@ -3400,8 +3400,8 @@ def build_game_results(sel_date):
         home_rpg = _park_neutral_rpg(team_off.get(hid, league_rpg), pf["run"])
         away_rpg = _park_neutral_rpg(team_off.get(aid, league_rpg),
                                      PARK_FACTORS.get(aid, NEUTRAL_PARK)["run"])
-        away_sp = fetch_pitcher_stats(r.get("away_prob_id"))
-        home_sp = fetch_pitcher_stats(r.get("home_prob_id"))
+        away_sp = fetch_pitcher_stats(r.get("away_prob_id"), season=sel_date.year)
+        home_sp = fetch_pitcher_stats(r.get("home_prob_id"), season=sel_date.year)
         away_bp = bullpen_era.get(aid, LEAGUE_BULLPEN_ERA_DEFAULT)
         home_bp = bullpen_era.get(hid, LEAGUE_BULLPEN_ERA_DEFAULT)
 
@@ -3506,8 +3506,8 @@ def build_prop_results(sel_date, max_games=None):
                 gm_row = match.iloc[0]
         away_pid = gm_row.get("away_prob_id") if gm_row is not None else None
         home_pid = gm_row.get("home_prob_id") if gm_row is not None else None
-        away_sp = fetch_pitcher_stats(away_pid)
-        home_sp = fetch_pitcher_stats(home_pid)
+        away_sp = fetch_pitcher_stats(away_pid, season=sel_date.year)
+        home_sp = fetch_pitcher_stats(home_pid, season=sel_date.year)
 
         slot_by_team = {hid: {}, aid: {}}
         for b in box:
@@ -3613,8 +3613,8 @@ def run_prop_backtest(sel_date, days_back=14, max_games_per_day=None):
             hid = int(r.get("home_team_id") or 0)
             aid = int(r.get("away_team_id") or 0)
             park = PARK_FACTORS.get(hid, NEUTRAL_PARK)
-            away_sp = fetch_pitcher_stats(r.get("away_prob_id")) if r.get("away_prob_id") else {"era": 4.5}
-            home_sp = fetch_pitcher_stats(r.get("home_prob_id")) if r.get("home_prob_id") else {"era": 4.5}
+            away_sp = fetch_pitcher_stats(r.get("away_prob_id"), season=sel_date.year) if r.get("away_prob_id") else {"era": 4.5}
+            home_sp = fetch_pitcher_stats(r.get("home_prob_id"), season=sel_date.year) if r.get("home_prob_id") else {"era": 4.5}
             # Real batting order for both teams, straight from the box score — more
             # accurate than a pre-game lineup guess since this is what actually happened.
             slot_by_team = {hid: {}, aid: {}}
@@ -3659,8 +3659,107 @@ def run_prop_backtest(sel_date, days_back=14, max_games_per_day=None):
     return recs, days_done, games_scored
 
 
+BATTERS_FACED_PER_9 = 38.5  # league-average batters faced per 9 innings, used
+                             # to convert Fangraphs' K% (a fraction of batters
+                             # faced) into a K9-equivalent rate comparable to
+                             # the MLB Stats API's strikeoutsPer9Inn. An
+                             # approximation, same category as the other
+                             # league constants in this file.
+
+
+@st.cache_data(ttl=604800, show_spinner=False)  # 7 days — this rarely changes
+def fetch_id_crosswalk():
+    """MLBAM player ID -> Fangraphs player ID. These are two completely
+    different numbering systems — Fangraphs' pitching_stats() returns its own
+    IDs, while every other fetch in this file (and every player_id already
+    flowing through the model) is keyed by MLBAM ID. Blending Fangraphs data
+    in WITHOUT this crosswalk would either match nobody, or worse, silently
+    match the wrong player if any ID happened to coincide. Uses pybaseball's
+    bundled Chadwick register (the standard, actively-maintained crosswalk for
+    exactly this problem) rather than trying to match by name, which breaks on
+    suffixes, accents, and Jr./Sr. Returns {} on any failure — degrades to "no
+    blend available" rather than crashing anything that calls it.
+    """
+    try:
+        from pybaseball import chadwick_register
+        reg = chadwick_register()
+    except Exception:
+        return {}
+    if reg is None or reg.empty or "key_mlbam" not in reg.columns or "key_fangraphs" not in reg.columns:
+        return {}
+    reg = reg.dropna(subset=["key_mlbam", "key_fangraphs"])
+    reg = reg[reg["key_fangraphs"] > 0]
+    return dict(zip(reg["key_mlbam"].astype(int), reg["key_fangraphs"].astype(int)))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_fangraphs_pitcher_advanced_by_mlbam(season: int):
+    """fetch_fangraphs_pitcher_advanced(), re-keyed from Fangraphs IDs to MLBAM
+    IDs via fetch_id_crosswalk(), so it can be looked up with the same
+    pitcher_id every other fetch in this file already uses. Returns
+    {mlbam_id: {"xFIP":.., "SIERA":.., "K%":.., "BB%":..}}. Empty dict on any
+    failure (Fangraphs blocked, crosswalk unavailable) — every caller treats
+    a missing entry as "no advanced data for this pitcher", not an error.
+    """
+    fg = fetch_fangraphs_pitcher_advanced(season)
+    if fg is None or fg.empty:
+        return {}
+    crosswalk = fetch_id_crosswalk()
+    if not crosswalk:
+        return {}
+    fg_to_mlbam = {v: k for k, v in crosswalk.items()}
+    out = {}
+    for _, row in fg.iterrows():
+        mlbam = fg_to_mlbam.get(int(row["player_id"])) if pd.notna(row["player_id"]) else None
+        if mlbam:
+            out[mlbam] = {"xFIP": row.get("xFIP"), "SIERA": row.get("SIERA"),
+                         "K%": row.get("K%"), "BB%": row.get("BB%")}
+    return out
+
+
+def _blend_pitcher_advanced(sp, pitcher_id, fg_by_mlbam):
+    """Blend MLB-Stats-API pitcher rates with Fangraphs' xFIP and K% where
+    available for this specific pitcher. Returns a NEW dict; never mutates the
+    input, and returns `sp` completely unchanged if no match is found — a
+    pitcher missing from the crosswalk or Fangraphs data just gets the
+    existing ERA-only behaviour, never an error.
+
+    era: 50/50 blend with xFIP. xFIP is a better predictor of FUTURE
+    performance (strips out defense, sequencing and luck that ERA can't), but
+    the league constants and existing calibration were fit against plain ERA,
+    so this doesn't fully replace it — same reasoning as blending real platoon
+    splits toward the flat constant rather than trusting either source alone.
+    Provisional 50/50 weighting; worth revisiting once there's tracked results
+    to fit it against, same as everything else blended this way in this file.
+
+    strikeoutsPer9Inn: 50/50 blend with a K9-equivalent derived from
+    Fangraphs' K% (see BATTERS_FACED_PER_9). whip is deliberately NOT blended
+    — Fangraphs' BB% only covers walks, not hits allowed, so it's too rough a
+    proxy for a stat that's specifically walks+hits.
+    """
+    if not fg_by_mlbam or not pitcher_id:
+        return sp
+    fg_row = fg_by_mlbam.get(int(pitcher_id))
+    if not fg_row:
+        return sp
+    out = dict(sp)
+    xfip = fg_row.get("xFIP")
+    if xfip is not None and pd.notna(xfip):
+        out["era"] = 0.5 * sp.get("era", 4.5) + 0.5 * float(xfip)
+        out["xfip"] = float(xfip)
+    kpct = fg_row.get("K%")
+    if kpct is not None and pd.notna(kpct):
+        k9_equiv = float(kpct) * BATTERS_FACED_PER_9
+        out["strikeoutsPer9Inn"] = 0.5 * sp.get("strikeoutsPer9Inn", 8.5) + 0.5 * k9_equiv
+    return out
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_pitcher_stats(pitcher_id):
+def fetch_pitcher_stats(pitcher_id, season=None):
+    """season is optional and purely additive: pass it to blend in Fangraphs
+    xFIP/K% (see _blend_pitcher_advanced); omit it and this behaves exactly as
+    it always has, ERA-only from the MLB Stats API. Every existing caller that
+    doesn't pass season is unaffected."""
     if not pitcher_id or pd.isna(pitcher_id):
         return {"era":4.50,"whip":1.35,"homeRunsPer9":1.20,"strikeoutsPer9Inn":8.5,"name":"TBD"}
     data = safe_get(f"https://statsapi.mlb.com/api/v1/people/{int(pitcher_id)}", {
@@ -3669,13 +3768,17 @@ def fetch_pitcher_stats(pitcher_id):
     person = data.get("people",[{}])[0]
     splits = person.get("stats",[{}])[0].get("splits",[{}]) if person.get("stats") else [{}]
     stat = splits[0].get("stat",{}) if splits else {}
-    return {
+    sp = {
         "name":              person.get("fullName","TBD"),
         "era":               float(stat.get("era") or 4.50),
         "whip":              float(stat.get("whip") or 1.35),
         "homeRunsPer9":      float(stat.get("homeRunsPer9") or 1.20),
         "strikeoutsPer9Inn": float(stat.get("strikeoutsPer9Inn") or 8.50),
     }
+    if season is not None:
+        fg_by_mlbam = fetch_fangraphs_pitcher_advanced_by_mlbam(season)
+        sp = _blend_pitcher_advanced(sp, pitcher_id, fg_by_mlbam)
+    return sp
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_active_roster(team_id: int):
